@@ -1,0 +1,28 @@
+{
+  "name": "caidanw-pi-plugins",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Small, reusable extensions for the pi coding agent",
+  "license": "MIT",
+  "keywords": [
+    "pi-package",
+    "pi-coding-agent"
+  ],
+  "scripts": {
+    "test": "node --test test/*.test.mjs"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "peerDependenciesMeta": {
+    "@earendil-works/pi-coding-agent": {
+      "optional": true
+    }
+  },
+  "pi": {
+    "extensions": [
+      "./extensions/*.ts"
+    ]
+  }
+}
