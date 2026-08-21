@@ -60,13 +60,16 @@ async function waitFor(check, timeout = 5_000) {
 
 function extensionHarness(directory, selection) {
 	const commands = new Map();
+	const messages = [];
 	const notifications = [];
 	planExecutionExtension({
 		registerCommand(name, options) { commands.set(name, options); },
+		sendMessage(message) { messages.push(message); },
 		on() {},
 	});
 	return {
 		commands,
+		messages,
 		notifications,
 		ctx: {
 			cwd: directory,
@@ -94,6 +97,14 @@ function useFakePi(t, path) {
 		else process.env.PI_PLAN_PI_BINARY = previous;
 	});
 }
+
+test("plan commands leave durable visible feedback", async (t) => {
+	const directory = await temporaryDirectory(t);
+	const { commands, ctx, messages } = extensionHarness(directory, "");
+
+	await commands.get("plan-status").handler("", ctx);
+	assert.match(messages.at(-1).content, /No active plan/);
+});
 
 test("rejects malformed and cyclic task graphs", () => {
 	assert.throws(() => parseTaskGraph({}), /version/);

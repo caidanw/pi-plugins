@@ -173,6 +173,15 @@ export default function planExecutionExtension(pi: ExtensionAPI) {
 	let active: ActiveRun | undefined;
 	let planningAbort: AbortController | undefined;
 
+	function report(ctx: ExtensionCommandContext, message: string, level: "info" | "warning" | "error"): void {
+		ctx.ui.notify(message, level);
+		try {
+			pi.sendMessage({ customType: "plan-execution-status", content: `[plan] ${message}`, display: true }, { triggerTurn: false });
+		} catch {
+			// Notifications remain available when the session cannot accept a durable message.
+		}
+	}
+
 	async function runPlanner(
 		ctx: ExtensionCommandContext,
 		sourcePath: string,
@@ -241,11 +250,11 @@ export default function planExecutionExtension(pi: ExtensionAPI) {
 		run.abort = undefined;
 		const failure = piFailure(result);
 		if (failure || !result.output.trim()) {
-			run.ctx.ui.notify(`Plan completed, but audit failed: ${failure ?? "no audit output"}`, "warning");
+			report(run.ctx, `Plan completed, but audit failed: ${failure ?? "no audit output"}`, "warning");
 			return;
 		}
 		await writeFile(run.paths.audit, `${result.output.trim()}\n`, "utf8");
-		run.ctx.ui.notify(`Plan completed. Audit: ${relative(run.ctx.cwd, run.paths.audit)}`, "info");
+		report(run.ctx, `Plan completed. Audit: ${relative(run.ctx.cwd, run.paths.audit)}`, "info");
 	}
 
 	async function pauseTask(run: ActiveRun, task: PlanTask): Promise<void> {
@@ -253,7 +262,7 @@ export default function planExecutionExtension(pi: ExtensionAPI) {
 		run.graph.status = "paused";
 		run.abort = undefined;
 		await saveTaskGraph(run.paths.tasks, run.graph);
-		run.ctx.ui.notify(`Plan paused at ${task.id}`, "info");
+		report(run.ctx, `Plan paused at ${task.id}`, "info");
 	}
 
 	async function execute(run: ActiveRun): Promise<void> {
@@ -268,7 +277,7 @@ export default function planExecutionExtension(pi: ExtensionAPI) {
 				}
 				run.graph.status = "failed";
 				await saveTaskGraph(run.paths.tasks, run.graph);
-				run.ctx.ui.notify("Plan stopped: pending tasks are blocked", "error");
+				report(run.ctx, "Plan stopped: pending tasks are blocked", "error");
 				return;
 			}
 
@@ -276,7 +285,7 @@ export default function planExecutionExtension(pi: ExtensionAPI) {
 				task.status = "failed";
 				run.graph.status = "failed";
 				await saveTaskGraph(run.paths.tasks, run.graph);
-				run.ctx.ui.notify(`${task.id} has no attempts remaining`, "error");
+				report(run.ctx, `${task.id} has no attempts remaining`, "error");
 				return;
 			}
 
@@ -344,7 +353,7 @@ export default function planExecutionExtension(pi: ExtensionAPI) {
 			if (result === "failed") run.graph.status = "failed";
 			await saveTaskGraph(run.paths.tasks, run.graph);
 			if (result === "failed") {
-				run.ctx.ui.notify(`${task.id} failed after two attempts`, "error");
+				report(run.ctx, `${task.id} failed after two attempts`, "error");
 				return;
 			}
 		}
@@ -371,7 +380,7 @@ export default function planExecutionExtension(pi: ExtensionAPI) {
 				run.graph.status = run.stopRequested ? "paused" : "failed";
 				await saveTaskGraph(run.paths.tasks, run.graph).catch(() => {});
 			}
-			run.ctx.ui.notify(`Plan execution stopped: ${message}`, "error");
+			report(run.ctx, `Plan execution stopped: ${message}`, "error");
 		}).finally(() => {
 			run.ctx.ui.setStatus(STATUS_KEY, undefined);
 			if (active === run) active = undefined;
@@ -384,11 +393,11 @@ export default function planExecutionExtension(pi: ExtensionAPI) {
 			await ctx.waitForIdle();
 			if (!ctx.hasUI) throw new Error("/execute-plan requires an interactive UI");
 			if (active || planningAbort) {
-				ctx.ui.notify("A plan is already active", "warning");
+				report(ctx, "A plan is already active", "warning");
 				return;
 			}
 			if (!args.trim()) {
-				ctx.ui.notify("Usage: /execute-plan <plan.md>", "warning");
+				report(ctx, "Usage: /execute-plan <plan.md>", "warning");
 				return;
 			}
 
@@ -396,13 +405,13 @@ export default function planExecutionExtension(pi: ExtensionAPI) {
 			try {
 				sourcePath = await realpath(resolve(ctx.cwd, args.trim()));
 			} catch {
-				ctx.ui.notify(`Plan not found: ${args.trim()}`, "error");
+				report(ctx, `Plan not found: ${args.trim()}`, "error");
 				return;
 			}
 			try {
 				modelName(ctx);
 			} catch (error: unknown) {
-				ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
+				report(ctx, error instanceof Error ? error.message : String(error), "error");
 				return;
 			}
 			const paths = planPaths(sourcePath);
@@ -413,16 +422,17 @@ export default function planExecutionExtension(pi: ExtensionAPI) {
 					existing = normalizeForResume(await loadTaskGraph(paths.tasks));
 					if (await realpath(resolve(ctx.cwd, existing.sourcePlan)) !== sourcePath) throw new Error("Task graph belongs to a different source plan");
 				} catch (error: unknown) {
-					ctx.ui.notify(`Cannot load ${relative(ctx.cwd, paths.tasks)}: ${error instanceof Error ? error.message : String(error)}`, "error");
+					report(ctx, `Cannot load ${relative(ctx.cwd, paths.tasks)}: ${error instanceof Error ? error.message : String(error)}`, "error");
 					return;
 				}
 				if (existing.status === "completed") {
-					ctx.ui.notify(`Plan already completed: ${relative(ctx.cwd, paths.tasks)}`, "info");
+					report(ctx, `Plan already completed: ${relative(ctx.cwd, paths.tasks)}`, "info");
 					return;
 				}
 				const choices = existing.status === "failed" ? ["Regenerate", "Cancel"] : ["Resume", "Regenerate", "Cancel"];
 				const action = await ctx.ui.select("Unfinished task graph found", choices);
 				if (action === "Resume") {
+					report(ctx, `Resuming ${storedSourcePath}`, "info");
 					await saveTaskGraph(paths.tasks, existing);
 					await startExecution(ctx, paths, existing);
 					return;
@@ -433,6 +443,7 @@ export default function planExecutionExtension(pi: ExtensionAPI) {
 
 			planningAbort = new AbortController();
 			ctx.ui.setStatus(STATUS_KEY, "planning tasks");
+			report(ctx, `Planning ${storedSourcePath}`, "info");
 			try {
 				const graph = await planAndApprove(ctx, sourcePath, storedSourcePath, existing);
 				if (!graph) return;
@@ -440,10 +451,10 @@ export default function planExecutionExtension(pi: ExtensionAPI) {
 				if (baseline.gitStatus && !await ctx.ui.confirm("Dirty worktree", `Existing changes will be recorded for the auditor:\n\n${baseline.gitStatus}\n\nContinue?`)) return;
 				graph.baseline = baseline;
 				await saveTaskGraph(paths.tasks, graph);
-				ctx.ui.notify("Plan approved. Keep this checkout read-only while workers run.", "warning");
+				report(ctx, "Plan approved. Keep this checkout read-only while workers run.", "warning");
 				await startExecution(ctx, paths, graph);
 			} catch (error: unknown) {
-				if (!planningAbort.signal.aborted) ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
+				if (!planningAbort.signal.aborted) report(ctx, error instanceof Error ? error.message : String(error), "error");
 			} finally {
 				planningAbort = undefined;
 				if (!active) ctx.ui.setStatus(STATUS_KEY, undefined);
@@ -455,16 +466,16 @@ export default function planExecutionExtension(pi: ExtensionAPI) {
 		description: "Show plan execution status",
 		handler: async (_args, ctx) => {
 			if (planningAbort) {
-				ctx.ui.notify("Plan status: planning", "info");
+				report(ctx, "Plan status: planning", "info");
 				return;
 			}
 			if (!active) {
-				ctx.ui.notify("No active plan", "info");
+				report(ctx, "No active plan", "info");
 				return;
 			}
 			const passed = active.graph.tasks.filter((task) => task.status === "passed").length;
 			const failed = active.graph.tasks.find((task) => task.status === "failed");
-			ctx.ui.notify([
+			report(ctx, [
 				`Plan: ${active.graph.sourcePlan}`,
 				`Status: ${active.graph.status}`,
 				`Phase: ${active.phase}`,
@@ -480,11 +491,11 @@ export default function planExecutionExtension(pi: ExtensionAPI) {
 		handler: async (_args, ctx) => {
 			if (planningAbort) {
 				planningAbort.abort();
-				ctx.ui.notify("Planning stopped", "info");
+				report(ctx, "Planning stopped", "info");
 				return;
 			}
 			if (!active) {
-				ctx.ui.notify("No active plan", "info");
+				report(ctx, "No active plan", "info");
 				return;
 			}
 			active.stopRequested = true;
