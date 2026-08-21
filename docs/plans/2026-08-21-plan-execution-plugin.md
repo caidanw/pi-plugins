@@ -44,7 +44,7 @@ validated task DAG
     ↓
 human review and feedback loop
     ↓
-background controller
+focused controller dashboard
     ↓
 fresh implementation process for one ready task
     ↓
@@ -93,6 +93,29 @@ The review shows each task's:
 Selecting **Add feedback** opens a text editor. Feedback may reference task IDs, add missing work, change dependencies, or request task splits and merges. The plugin launches a fresh planner with the original plan, current DAG, and feedback, then repeats the review.
 
 Approval persists the DAG and starts execution automatically. Approval is the trust boundary for model-generated verification commands, which run through the user's shell with the user's permissions. Every regenerated DAG requires fresh approval.
+
+## Focused Workflow UI
+
+In TUI mode, replace the editor with a focused dashboard while planning, executing, verifying, repairing, or auditing. This prevents concurrent edits in the shared checkout. Keep the existing task-review selector and feedback editor between dashboard phases.
+
+The dashboard shows:
+
+- The current workflow phase and elapsed time.
+- Passed, active, and pending tasks.
+- The current attempt out of two.
+- The verification command and recent output.
+- Friendly activity lines derived from child Pi tool events.
+
+Parse JSON events as each subprocess writes them. Convert recognized tool starts into concise activities such as `Reading package.json`, `Searching for requestParser`, and `Editing src/request.ts`. Ignore unknown events and raw model text. Keep at most 200 activities in memory and display the newest 8–24 based on terminal height. Show how many earlier activities are hidden. Throttle rendering to avoid flicker.
+
+The first `Esc` displays `Press Esc again within 2 seconds to pause and exit`. A second `Esc` within that window confirms. The action depends on the phase:
+
+- Planning: abort and discard the unapproved graph.
+- Review: cancel without executing.
+- Execution or verification: terminate the process group, preserve partial working-tree changes, count the attempt, mark the task pending, and persist the graph as paused.
+- Audit: stop the advisory audit while preserving the completed run.
+
+Close the dashboard after cancellation, failure, or completion and add a durable `[plan]` summary to chat. Keep the existing durable-message behavior for RPC and other non-TUI clients. The task graph remains the source of truth; dashboard failures must not change controller results.
 
 ## Task Graph
 
@@ -153,7 +176,7 @@ Store the dirty-worktree baseline at the graph's top level. Store each verificat
 
 ## Execution
 
-The controller runs in the background so Pi remains interactive. Before starting, warn the user not to edit the checkout or launch another writing agent until the run stops; v1 does not lock the worktree.
+In TUI mode, the controller runs behind the focused dashboard and blocks normal editor input. RPC and other non-TUI clients retain background execution and durable status messages. V1 does not lock the worktree, so external editors and processes can still create conflicts.
 
 For each task:
 
@@ -225,7 +248,7 @@ Write the result to `<name>.audit.md` and notify the user. V1 does not block com
 ## Recovery and Cancellation
 
 - `/plan-status` reads in-memory state while a worker is alive and reports the active plan, current task, passed count, failed task, and worker state without writing `tasks.json`.
-- `/plan-stop` aborts the current subprocess, waits for it to exit, restores the current task to `pending`, then persists the run as `paused` without discarding completed evidence or decrementing attempts.
+- Confirmed `Esc` in the TUI and `/plan-stop` in other clients abort the current subprocess, wait for it to exit, restore the current task to `pending`, then persist the run as `paused` without discarding completed evidence or decrementing attempts.
 - `session_shutdown` follows the same abort-and-persist sequence when shutdown hooks run.
 - On load, normalize any stale `running` task to `pending` while preserving its attempt count. This recovers from a hard process crash that skipped shutdown hooks.
 - `/execute-plan <same-plan>` detects unfinished state and offers **Resume**, **Regenerate**, or **Cancel**.
@@ -260,8 +283,12 @@ Test observable behavior:
 8. Terminate ordinary background process-group descendants before integrity checks.
 9. Preserve completed state across reload/resume.
 10. Write a successful audit and keep a completed run successful when the optional audit process fails.
+11. Parse streamed JSON across chunk boundaries and convert known tool events into bounded activity text.
+12. Require two `Esc` presses within two seconds before cancellation.
+13. Keep controller results unchanged when dashboard rendering fails.
+14. Preserve the existing durable-message flow outside TUI mode.
 
-Use a fake Pi executable for subprocess tests. Do not call real models in the test suite.
+Use a fake Pi executable for subprocess tests. Test the progress state and input handling without snapshotting terminal decoration. Do not call real models in the test suite.
 
 ## V1 Scope
 
@@ -275,6 +302,7 @@ Include:
 - Protected plan state.
 - Persistent status and resume.
 - Read-only final audit.
+- Focused TUI progress dashboard.
 
 Exclude:
 
@@ -292,6 +320,7 @@ Exclude:
 1. Add task graph types, parsing, validation, persistence, and unit tests.
 2. Add the Pi subprocess runner and protected-file checks.
 3. Add `/execute-plan` planning, review, feedback, and approval.
-4. Add the sequential background controller, verification, repair, status, stop, and resume.
+4. Add the sequential controller, verification, repair, status, stop, and resume.
 5. Add the final read-only audit and README documentation.
-6. Run the full test suite and manually exercise one two-task plan.
+6. Stream subprocess progress into a focused TUI dashboard with confirmed cancellation.
+7. Run the full test suite and manually exercise one two-task plan.
