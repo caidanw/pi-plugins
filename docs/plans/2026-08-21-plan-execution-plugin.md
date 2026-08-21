@@ -1,0 +1,297 @@
+# Plan Execution Plugin
+
+## Goal
+
+Add one Pi command that turns an approved Markdown plan into a reviewed task graph, executes every task with a fresh worker, verifies each task mechanically, and audits the final implementation.
+
+The plugin must prevent workers from skipping tasks, changing the plan, or declaring success without a passing verification command.
+
+## User Flow
+
+Start the workflow with one command:
+
+```text
+/execute-plan docs/plans/feature.md
+```
+
+The plugin then:
+
+1. Converts the Markdown plan into a strict task DAG.
+2. Shows the generated tasks for review.
+3. Offers **Approve and run**, **Add feedback**, or **Cancel**.
+4. Regenerates the DAG after feedback until approved.
+5. Executes dependency-ready tasks automatically.
+6. Runs each task's verification command.
+7. Runs a fresh read-only audit after every task passes.
+
+Keep two auxiliary commands:
+
+```text
+/plan-status
+/plan-stop
+```
+
+Calling `/execute-plan` again for an unfinished plan offers to resume or regenerate it. Regeneration discards prior task state and evidence only after confirmation, then requires a new approval before any verification command can run.
+
+## Architecture
+
+```text
+Markdown plan
+    ↓
+fresh read-only planner process
+    ↓
+validated task DAG
+    ↓
+human review and feedback loop
+    ↓
+background controller
+    ↓
+fresh implementation process for one ready task
+    ↓
+controller-owned verification
+    ↓
+next task
+    ↓
+fresh read-only final auditor
+```
+
+The original Markdown file remains the source of intent. A sibling `<name>.tasks.json` file stores the executable graph and runtime state. A sibling `<name>.audit.md` file stores the final audit.
+
+## Why Workers Are Pi Subprocesses
+
+`pi-subagents` exposes a structured delegation API for extensions, but depending on it is unnecessary for v1. Pi's example subagent extension also demonstrates the underlying mechanism: fresh `pi --mode json -p --no-session` processes.
+
+Use `node:child_process.spawn` to run Pi directly because it provides:
+
+- A fresh context for every task.
+- Explicit model, tools, working directory, environment, and cancellation control.
+- Structured JSON event output for progress and failure detection.
+- A live child handle for `/plan-stop` and `session_shutdown`.
+- No dependency on another extension or bridge package.
+
+A worker subprocess is therefore the implementation mechanism for a small subagent. A future version may delegate process management to `pi-subagents` if its richer orchestration becomes useful.
+
+## Planning and Approval
+
+The planning process uses the session's active model and receives:
+
+- The original Markdown plan.
+- Only non-mutating repository tools such as `read`, `grep`, `find`, and `ls`.
+- The current task graph when revising.
+- The user's feedback when revising.
+
+It returns JSON only. The plugin validates the result before showing it.
+
+The review shows each task's:
+
+- ID and description.
+- Dependencies.
+- Acceptance criteria.
+- Expected files.
+- Verification command.
+
+Selecting **Add feedback** opens a text editor. Feedback may reference task IDs, add missing work, change dependencies, or request task splits and merges. The plugin launches a fresh planner with the original plan, current DAG, and feedback, then repeats the review.
+
+Approval persists the DAG and starts execution automatically. Approval is the trust boundary for model-generated verification commands, which run through the user's shell with the user's permissions. Every regenerated DAG requires fresh approval.
+
+## Task Graph
+
+```json
+{
+  "version": 1,
+  "sourcePlan": "docs/plans/feature.md",
+  "status": "approved",
+  "baseline": {
+    "gitStatus": "",
+    "gitDiff": ""
+  },
+  "tasks": [
+    {
+      "id": "T001",
+      "title": "Add the request parser",
+      "instructions": "Implement the parser described in the source plan.",
+      "acceptance": [
+        "Valid requests produce a parsed request",
+        "Invalid requests return the documented error"
+      ],
+      "dependsOn": [],
+      "expectedFiles": ["src/request.ts", "test/request.test.ts"],
+      "verification": "npm test -- test/request.test.ts",
+      "status": "pending",
+      "attempts": 0
+    }
+  ]
+}
+```
+
+Required validation:
+
+- Version is supported.
+- Task IDs are unique.
+- Every dependency exists.
+- The graph has no cycles.
+- Every task has acceptance criteria and a verification command.
+- Every status is recognized.
+- At least one task exists.
+
+Allow these run statuses: `approved`, `running`, `paused`, `completed`, and `failed`.
+
+```text
+approved → running → completed
+              ↘ failed
+              ↘ paused → running
+```
+
+Use these task states:
+
+```text
+pending → running → passed
+                  ↘ failed
+```
+
+Store the dirty-worktree baseline at the graph's top level. Store each verification command, exit code, and bounded output as task completion evidence.
+
+## Execution
+
+The controller runs in the background so Pi remains interactive. Before starting, warn the user not to edit the checkout or launch another writing agent until the run stops; v1 does not lock the worktree.
+
+For each task:
+
+1. Select the first dependency-ready pending task in array order.
+2. Increment `attempts`, mark it running, and persist the graph.
+3. Snapshot and hash the protected files.
+4. Spawn a fresh Pi worker with `node:child_process.spawn` in the project directory, using the session's active model.
+5. Give it a bounded task packet.
+6. Wait for the worker to exit, terminate ordinary remaining process-group descendants, and avoid writing `tasks.json` while the child is alive.
+7. Verify protected-file integrity before and after verification.
+8. Run the verification command through the controller with a 10-minute timeout.
+9. Mark the task passed only when verification exits with code 0.
+10. Continue with the next ready task.
+
+The task packet contains:
+
+```text
+Source plan path
+Current task ID, instructions, and acceptance criteria
+Completed dependency summaries and verification evidence
+Expected files
+Verification command
+```
+
+Workers may read the source plan and repository for context. They must not implement unrelated future tasks. The instruction not to make Git commits is advisory in v1.
+
+A worker crash, protected-file violation, verification timeout, or nonzero verification exit consumes the attempt. Launch one fresh repair worker with the original task and failure output only when `attempts < 2`. Persist attempts across pauses and resumes; a pending task already at two attempts fails without launching a third worker. After two unsuccessful attempts, mark the task failed and stop the run.
+
+## Parallelism
+
+The planner records the full dependency DAG and identifies independent work through dependency edges and expected files.
+
+V1 still executes one task at a time in one checkout. Parallel writers require isolated worktrees, merge ordering, and conflict recovery. Add parallel execution only when sequential execution is measurably too slow.
+
+## Protected Plan State
+
+Protect both the source Markdown plan and generated task graph.
+
+For each worker:
+
+1. Resolve protected paths to canonical absolute paths and pass them through an environment variable.
+2. Load a worker-mode extension hook that canonicalizes target paths and blocks `edit` and `write` calls targeting protected files.
+3. Snapshot both files, including content hashes, modes, inode identity, and link counts, before the worker starts.
+4. Do not let the controller write `tasks.json` while the worker is alive.
+5. After the worker exits and after verification, detect content, mode, identity, deletion, rename, symlink, or hard-link changes.
+6. Unlink any changed path, recreate it from the controller snapshot, and reject the attempt if integrity changed through `bash`, a path alias, or another route.
+
+The post-exit integrity check and restoration are authoritative; the tool hook provides early feedback. Process-group cleanup stops ordinary background descendants. A process that deliberately creates a new OS session can escape this v1 control; preventing that requires an OS sandbox. A rejected attempt consumes one of the task's two attempts. Workers retain read access. Only the controller changes task status or evidence.
+
+## Final Audit
+
+After every task passes, launch a fresh read-only Pi process. Give it:
+
+- The original Markdown plan.
+- The completed task graph and evidence.
+- Baseline and final Git status/diff information.
+- Read-only repository tools.
+
+Ask it to report:
+
+- Original plan requirements omitted from the DAG.
+- Tasks incompletely represented in the implementation.
+- Missing wiring or dead implementations.
+- Unplanned scope changes.
+- Claims unsupported by verification evidence.
+
+Write the result to `<name>.audit.md` and notify the user. V1 does not block completion or automatically fix audit findings.
+
+## Recovery and Cancellation
+
+- `/plan-status` reads in-memory state while a worker is alive and reports the active plan, current task, passed count, failed task, and worker state without writing `tasks.json`.
+- `/plan-stop` aborts the current subprocess, waits for it to exit, restores the current task to `pending`, then persists the run as `paused` without discarding completed evidence or decrementing attempts.
+- `session_shutdown` follows the same abort-and-persist sequence when shutdown hooks run.
+- On load, normalize any stale `running` task to `pending` while preserving its attempt count. This recovers from a hard process crash that skipped shutdown hooks.
+- `/execute-plan <same-plan>` detects unfinished state and offers **Resume**, **Regenerate**, or **Cancel**.
+- **Regenerate** confirms that all task state and evidence will be discarded, then starts a fresh planning and approval flow.
+- Reject a second run while another controller is active.
+
+Warn before starting from a dirty worktree. If the user proceeds, record bounded baseline Git status plus staged and unstaged diffs in the top-level `baseline` field so the final auditor can distinguish pre-existing changes where possible.
+
+## Error Handling
+
+- Invalid planner JSON: show the validation error and offer another feedback/revision pass.
+- Missing or unauthenticated model: stop before writing executable state.
+- Planner crash: retain the last valid task graph.
+- User or shutdown cancellation: restore the current task to pending, preserve its attempt count, and pause the run; never mark it passed.
+- Worker crash, protected-file violation, verification timeout, or nonzero verification exit: record bounded failure evidence and apply the two-attempt rule.
+- No dependency-ready task while pending tasks remain: report an invalid or blocked graph and stop.
+- Audit failure: preserve the completed run and report that the audit could not be generated.
+
+## Tests
+
+Use Node's built-in test runner.
+
+Test observable behavior:
+
+1. Reject malformed or cyclic task graphs.
+2. Dispatch only tasks whose dependencies passed.
+3. Advance only after a verification command exits successfully.
+4. Retry once after failed verification, then stop.
+5. Restore protected files and reject content, mode, identity, deletion, rename, symlink, or hard-link changes.
+6. Normalize a stale running task to pending while preserving its attempt count, and never launch a third attempt.
+7. Stop before spawning when cancellation arrives during setup.
+8. Terminate ordinary background process-group descendants before integrity checks.
+9. Preserve completed state across reload/resume.
+10. Write a successful audit and keep a completed run successful when the optional audit process fails.
+
+Use a fake Pi executable for subprocess tests. Do not call real models in the test suite.
+
+## V1 Scope
+
+Include:
+
+- Markdown-to-DAG planning.
+- Human approval and feedback loop.
+- Sequential fresh workers.
+- Controller-owned verification.
+- One repair attempt.
+- Protected plan state.
+- Persistent status and resume.
+- Read-only final audit.
+
+Exclude:
+
+- Parallel workers.
+- Git worktree creation or merges.
+- OS-level worker sandboxing.
+- Multiple concurrent plans.
+- Configurable retry policies.
+- Custom model routing.
+- Automatic fixes from audit findings.
+- External issue trackers or databases.
+
+## Implementation Order
+
+1. Add task graph types, parsing, validation, persistence, and unit tests.
+2. Add the Pi subprocess runner and protected-file checks.
+3. Add `/execute-plan` planning, review, feedback, and approval.
+4. Add the sequential background controller, verification, repair, status, stop, and resume.
+5. Add the final read-only audit and README documentation.
+6. Run the full test suite and manually exercise one two-task plan.
