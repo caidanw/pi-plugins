@@ -13,9 +13,11 @@ import {
 	normalizeForResume,
 	parseTaskGraph,
 	restoreChangedFiles,
+	runPi,
 	runVerification,
 	saveTaskGraph,
 } from "../extensions/plan-execution/core.ts";
+import { activityFromPiEvent, PlanDashboard } from "../extensions/plan-execution/ui.ts";
 
 function graph(tasks = [task("T001")]) {
 	return {
@@ -58,12 +60,12 @@ async function waitFor(check, timeout = 5_000) {
 	throw new Error("Timed out waiting for plan execution");
 }
 
-function extensionHarness(directory, selection) {
+function extensionHarness(directory, selection, options = {}) {
 	const commands = new Map();
 	const messages = [];
 	const notifications = [];
 	planExecutionExtension({
-		registerCommand(name, options) { commands.set(name, options); },
+		registerCommand(name, command) { commands.set(name, command); },
 		sendMessage(message) { messages.push(message); },
 		on() {},
 	});
@@ -74,6 +76,7 @@ function extensionHarness(directory, selection) {
 		ctx: {
 			cwd: directory,
 			hasUI: true,
+			mode: options.mode,
 			model: { provider: "fake", id: "model" },
 			thinkingLevel: "off",
 			modelRegistry: { hasConfiguredAuth: () => true },
@@ -84,6 +87,7 @@ function extensionHarness(directory, selection) {
 				editor: async () => "",
 				notify: (message, level) => notifications.push({ message, level }),
 				setStatus: () => {},
+				...options.ui,
 			},
 		},
 	};
@@ -97,6 +101,81 @@ function useFakePi(t, path) {
 		else process.env.PI_PLAN_PI_BINARY = previous;
 	});
 }
+
+test("turns known Pi tool events into concise activity text", () => {
+	assert.equal(activityFromPiEvent({ type: "tool_execution_start", toolName: "read", args: { path: "src/app.ts" } }), "Reading src/app.ts");
+	assert.equal(activityFromPiEvent({ type: "tool_execution_start", toolName: "grep", args: { pattern: "parse", path: "test/" } }), "Searching test/ for parse");
+	assert.equal(activityFromPiEvent({ type: "tool_execution_start", toolName: "bash", args: { command: "npm test\nrm -rf nope" } }), "Running npm test rm -rf nope");
+	assert.equal(activityFromPiEvent({ type: "tool_execution_start", toolName: "unknown", args: {} }), undefined);
+});
+
+test("dashboard bounds activity history and confirms cancellation", async () => {
+	let cancellations = 0;
+	const tui = { terminal: { rows: 80 }, requestRender() {} };
+	const theme = { fg: (_color, text) => text, bold: (text) => text };
+	const dashboard = new PlanDashboard(tui, theme, "plan.md", "planning", () => { cancellations++; }, 10);
+	for (let index = 0; index < 205; index++) dashboard.addActivity(`Activity ${index}`);
+	assert.match(dashboard.render(100).join("\n"), /176 earlier activities/);
+
+	dashboard.handleInput("\x1b");
+	await new Promise((resolve) => setTimeout(resolve, 20));
+	dashboard.handleInput("\x1b");
+	assert.equal(cancellations, 0);
+	dashboard.handleInput("\x1b");
+	assert.equal(cancellations, 1);
+	dashboard.dispose();
+});
+
+test("streams split Pi JSON events without letting observers change results", async (t) => {
+	const directory = await temporaryDirectory(t);
+	const fakePi = join(directory, "fake-pi.mjs");
+	const event = JSON.stringify({ type: "tool_execution_start", toolCallId: "1", toolName: "read", args: { path: "plan.md" } });
+	const final = JSON.stringify({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "done" }], stopReason: "end" } });
+	await writeFile(fakePi, `#!/usr/bin/env node\nconst event = ${JSON.stringify(event)};\nprocess.stdout.write(event.slice(0, 20));\nsetTimeout(() => process.stdout.write(event.slice(20) + "\\n" + ${JSON.stringify(final)} + "\\n"), 10);\n`);
+	await chmod(fakePi, 0o755);
+	useFakePi(t, fakePi);
+	const events = [];
+
+	const result = await runPi({ cwd: directory, prompt: "test", model: "fake/model", tools: [], onEvent(event) { events.push(event); throw new Error("UI failed"); } });
+	assert.equal(events.length, 2);
+	assert.equal(events[0].type, "tool_execution_start");
+	assert.equal(result.output, "done");
+	assert.equal(result.code, 0);
+});
+
+test("dashboard lifecycle failures do not stop planning or execution", async (t) => {
+	const directory = await temporaryDirectory(t);
+	const fakePi = join(directory, "fake-pi.mjs");
+	await writeFile(join(directory, "plan.md"), "# Plan\n");
+	await writeFile(fakePi, `#!/usr/bin/env node
+const prompt = process.argv.at(-1) ?? "";
+const emit = (text) => console.log(JSON.stringify({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text }], stopReason: "end" } }));
+if (prompt.includes("read-only implementation planner")) setTimeout(() => emit(JSON.stringify(${JSON.stringify(graph())})), 20);
+else if (prompt.includes("implementation worker")) emit("done");
+else if (prompt.includes("fresh read-only final auditor")) emit("No findings.");
+else process.exit(2);
+`);
+	await chmod(fakePi, 0o755);
+	useFakePi(t, fakePi);
+	const ui = {
+		custom: (factory) => {
+			const component = factory(
+				{ terminal: { rows: 40 }, requestRender() {} },
+				{ fg: (_color, text) => text, bold: (text) => text },
+				{},
+				() => {},
+			);
+			component.dispose();
+			return Promise.reject(new Error("render failed"));
+		},
+	};
+	const { commands, ctx, notifications } = extensionHarness(directory, "Approve and run", { mode: "tui", ui });
+
+	await commands.get("execute-plan").handler("plan.md", ctx);
+	await waitFor(() => loadTaskGraph(join(directory, "plan.tasks.json")).then(({ status }) => status === "completed").catch(() => false));
+	assert.ok(notifications.some(({ message }) => message.includes("planning continues")));
+	assert.ok(notifications.some(({ message }) => message.includes("Progress dashboard closed")));
+});
 
 test("plan commands leave durable visible feedback", async (t) => {
 	const directory = await temporaryDirectory(t);
@@ -193,12 +272,13 @@ test("normalizes stale running state and preserves it across persistence", async
 	assert.deepEqual(await loadTaskGraph(path), normalized);
 });
 
-test("cleans up ordinary background descendants before verification returns", async (t) => {
+test("cleans up pipe-inheriting background descendants before verification returns", async (t) => {
 	const directory = await temporaryDirectory(t);
 	const delayed = join(directory, "delayed.txt");
-	const script = `setTimeout(() => require("node:fs").writeFileSync(${JSON.stringify(delayed)}, "escaped"), 300)`;
-	const result = await runVerification(`node -e ${JSON.stringify(script)} > /dev/null 2>&1 &`, directory, undefined, 2_000);
+	const script = `setTimeout(() => require("node:fs").writeFileSync(${JSON.stringify(delayed)}, "escaped"), 300); setInterval(() => {}, 1000)`;
+	const result = await runVerification(`node -e ${JSON.stringify(script)} &`, directory, undefined, 2_000);
 	assert.equal(result.code, 0);
+	assert.equal(result.timedOut, false);
 	await new Promise((resolve) => setTimeout(resolve, 500));
 	await assert.rejects(readFile(delayed));
 });
@@ -248,6 +328,83 @@ test("an immediate stop pauses before spawning a worker", async (t) => {
 	assert.equal(paused.tasks[0].status, "pending");
 	assert.equal(paused.tasks[0].attempts, 0);
 	await assert.rejects(readFile(marker));
+});
+
+test("confirmed dashboard cancellation pauses the active worker", async (t) => {
+	const directory = await temporaryDirectory(t);
+	const planPath = join(directory, "plan.md");
+	const tasksPath = join(directory, "plan.tasks.json");
+	const fakePi = join(directory, "fake-pi.mjs");
+	const marker = join(directory, "worker-started.txt");
+	await writeFile(planPath, "# Plan\n");
+	const value = graph();
+	value.status = "paused";
+	await saveTaskGraph(tasksPath, value);
+	await writeFile(fakePi, `#!/usr/bin/env node\nimport { writeFileSync } from "node:fs";\nwriteFileSync(${JSON.stringify(marker)}, "started");\nsetInterval(() => {}, 1_000);\n`);
+	await chmod(fakePi, 0o755);
+	useFakePi(t, fakePi);
+
+	let dashboard;
+	const ui = {
+		custom: (factory) => new Promise((resolve) => {
+			const tui = { terminal: { rows: 40 }, requestRender() {} };
+			const theme = { fg: (_color, text) => text, bold: (text) => text };
+			dashboard = factory(tui, theme, {}, (result) => {
+				dashboard?.dispose();
+				resolve(result);
+			});
+		}),
+	};
+	const { commands, ctx } = extensionHarness(directory, "Resume", { mode: "tui", ui });
+	const execution = commands.get("execute-plan").handler("plan.md", ctx);
+	await waitFor(async () => dashboard && await readFile(marker, "utf8").catch(() => undefined));
+
+	dashboard.handleInput("\x1b");
+	assert.equal((await loadTaskGraph(tasksPath)).status, "running");
+	dashboard.handleInput("\x1b");
+	await execution;
+
+	const paused = await loadTaskGraph(tasksPath);
+	assert.equal(paused.status, "paused");
+	assert.equal(paused.tasks[0].status, "pending");
+	assert.equal(paused.tasks[0].attempts, 1);
+});
+
+test("cancellation restores protected files changed by verification", async (t) => {
+	const directory = await temporaryDirectory(t);
+	const planPath = join(directory, "plan.md");
+	const tasksPath = join(directory, "plan.tasks.json");
+	const fakePi = join(directory, "fake-pi.mjs");
+	await writeFile(planPath, "# Original plan\n");
+	const value = graph();
+	value.status = "paused";
+	value.tasks[0].verification = `printf changed > ${JSON.stringify(planPath)}; sleep 10`;
+	await saveTaskGraph(tasksPath, value);
+	await writeFile(fakePi, `#!/usr/bin/env node\nconsole.log(JSON.stringify({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "done" }], stopReason: "end" } }));\n`);
+	await chmod(fakePi, 0o755);
+	useFakePi(t, fakePi);
+
+	let dashboard;
+	const ui = {
+		custom: (factory) => new Promise((resolve) => {
+			const tui = { terminal: { rows: 40 }, requestRender() {} };
+			const theme = { fg: (_color, text) => text, bold: (text) => text };
+			dashboard = factory(tui, theme, {}, (result) => {
+				dashboard?.dispose();
+				resolve(result);
+			});
+		}),
+	};
+	const { commands, ctx } = extensionHarness(directory, "Resume", { mode: "tui", ui });
+	const execution = commands.get("execute-plan").handler("plan.md", ctx);
+	await waitFor(async () => await readFile(planPath, "utf8") === "changed");
+
+	dashboard.handleInput("\x1b");
+	dashboard.handleInput("\x1b");
+	await execution;
+
+	assert.equal(await readFile(planPath, "utf8"), "# Original plan\n");
+	assert.equal((await loadTaskGraph(tasksPath)).status, "paused");
 });
 
 test("launches one fresh repair worker, writes a successful audit, and preserves completed state", async (t) => {
@@ -340,7 +497,7 @@ if (prompt.includes("read-only implementation planner")) {
 	await chmod(fakePi, 0o755);
 
 	useFakePi(t, fakePi);
-	const { commands, notifications, ctx } = extensionHarness(directory, "Approve and run");
+	const { commands, notifications, ctx } = extensionHarness(directory, "Approve and run", { mode: "rpc" });
 
 	await commands.get("execute-plan").handler("plan.md", ctx);
 	const completed = await waitFor(async () => {

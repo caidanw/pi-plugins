@@ -20,6 +20,7 @@ import {
 	type TaskEvidence,
 	type TaskGraph,
 } from "./plan-execution/core.ts";
+import { PlanDashboard, type DashboardPhase } from "./plan-execution/ui.ts";
 
 const READ_ONLY_TOOLS = ["read", "grep", "find", "ls"];
 const WORKER_TOOLS = ["read", "bash", "edit", "write", "grep", "find", "ls"];
@@ -35,6 +36,7 @@ type ActiveRun = {
 	abort?: AbortController;
 	stopRequested: boolean;
 	done: Promise<void>;
+	dashboard?: PlanDashboard;
 };
 
 function modelName(ctx: ExtensionCommandContext): string {
@@ -182,6 +184,52 @@ export default function planExecutionExtension(pi: ExtensionAPI) {
 		}
 	}
 
+	async function withDashboard<T>(
+		ctx: ExtensionCommandContext,
+		sourcePlan: string,
+		phase: DashboardPhase,
+		onCancel: () => void,
+		work: (dashboard: PlanDashboard) => Promise<T>,
+	): Promise<T> {
+		let failure: unknown;
+		let pending: Promise<T> | undefined;
+		let result: T | undefined;
+		try {
+			result = await ctx.ui.custom<T | undefined>((tui, theme, _keybindings, done) => {
+				const dashboard = new PlanDashboard(tui, theme, sourcePlan, phase, onCancel);
+				dashboard.addActivity("Inspecting the source plan and repository");
+				pending = work(dashboard);
+				pending.then(done).catch((error: unknown) => {
+					failure = error;
+					done(undefined);
+				});
+				return dashboard;
+			});
+		} catch (error: unknown) {
+			if (!pending) throw error;
+			ctx.ui.notify(`Progress dashboard closed; planning continues: ${error instanceof Error ? error.message : String(error)}`, "warning");
+			return pending;
+		}
+		if (failure !== undefined) throw failure;
+		return result as T;
+	}
+
+	async function selectWithConfirmedEscape(
+		ctx: ExtensionCommandContext,
+		title: string,
+		choices: string[],
+	): Promise<string | undefined> {
+		let cancelArmedUntil = 0;
+		while (true) {
+			const warning = cancelArmedUntil >= Date.now() ? "\n\n⚠ Press Esc again within 2 seconds to cancel" : "";
+			const action = await ctx.ui.select(`${title}${warning}`, choices);
+			if (action) return action;
+			const now = Date.now();
+			if (cancelArmedUntil >= now) return undefined;
+			cancelArmedUntil = now + 2_000;
+		}
+	}
+
 	async function runPlanner(
 		ctx: ExtensionCommandContext,
 		sourcePath: string,
@@ -189,14 +237,19 @@ export default function planExecutionExtension(pi: ExtensionAPI) {
 		current?: TaskGraph,
 		feedback?: string,
 	): Promise<TaskGraph> {
-		const result = await runPi({
+		const prompt = plannerPrompt(storedSourcePath, await readFile(sourcePath, "utf8"), current, feedback);
+		const plan = (dashboard?: PlanDashboard) => runPi({
 			cwd: ctx.cwd,
-			prompt: plannerPrompt(storedSourcePath, await readFile(sourcePath, "utf8"), current, feedback),
+			prompt,
 			model: modelName(ctx),
 			thinkingLevel: ctx.thinkingLevel,
 			tools: READ_ONLY_TOOLS,
 			signal: planningAbort?.signal,
+			onEvent: dashboard ? (event) => dashboard.handlePiEvent(event) : undefined,
 		});
+		const result = ctx.mode === "tui"
+			? await withDashboard(ctx, storedSourcePath, "planning", () => planningAbort?.abort(), plan)
+			: await plan();
 		const failure = piFailure(result);
 		if (failure) throw new Error(`Planner failed: ${failure}`);
 		if (!result.output.trim()) throw new Error("Planner returned no task graph");
@@ -218,15 +271,15 @@ export default function planExecutionExtension(pi: ExtensionAPI) {
 			} catch (error: unknown) {
 				if (planningAbort?.signal.aborted) return undefined;
 				const message = error instanceof Error ? error.message : String(error);
-				const action = await ctx.ui.select(`Task graph error\n\n${message}`, ["Try again", "Add feedback", "Cancel"]);
-				if (action === "Cancel" || !action) return undefined;
+				const action = await selectWithConfirmedEscape(ctx, `Task graph error\n\n${message}`, ["Try again", "Add feedback", "Cancel"]);
+				if (!action || action === "Cancel") return undefined;
 				if (action === "Add feedback") feedback = await ctx.ui.editor("Planner feedback", "");
 				continue;
 			}
 
-			const action = await ctx.ui.select(`Review generated task graph\n\n${reviewText(candidate)}`, ["Approve and run", "Add feedback", "Cancel"]);
+			const action = await selectWithConfirmedEscape(ctx, `Review generated task graph\n\n${reviewText(candidate)}`, ["Approve and run", "Add feedback", "Cancel"]);
 			if (action === "Approve and run") return candidate;
-			if (action === "Cancel" || !action) return undefined;
+			if (!action || action === "Cancel") return undefined;
 			feedback = await ctx.ui.editor("Planner feedback", "");
 			if (feedback === undefined) feedback = "";
 		}
@@ -238,6 +291,8 @@ export default function planExecutionExtension(pi: ExtensionAPI) {
 		run.currentTaskId = undefined;
 		run.abort = new AbortController();
 		run.ctx.ui.setStatus(STATUS_KEY, "auditing plan");
+		run.dashboard?.setPhase("audit", run.graph);
+		run.dashboard?.addActivity("Comparing the completed work with the source plan");
 		const [plan, final] = await Promise.all([readFile(run.paths.sourcePlan, "utf8"), gitState(run.ctx.cwd)]);
 		const result = await runPi({
 			cwd: run.ctx.cwd,
@@ -246,6 +301,7 @@ export default function planExecutionExtension(pi: ExtensionAPI) {
 			thinkingLevel: run.ctx.thinkingLevel,
 			tools: READ_ONLY_TOOLS,
 			signal: run.abort.signal,
+			onEvent: (event) => run.dashboard?.handlePiEvent(event),
 		});
 		run.abort = undefined;
 		const failure = piFailure(result);
@@ -258,6 +314,7 @@ export default function planExecutionExtension(pi: ExtensionAPI) {
 	}
 
 	async function pauseTask(run: ActiveRun, task: PlanTask): Promise<void> {
+		run.dashboard?.addActivity(`${task.id} paused; partial changes were preserved`);
 		task.status = "pending";
 		run.graph.status = "paused";
 		run.abort = undefined;
@@ -270,6 +327,7 @@ export default function planExecutionExtension(pi: ExtensionAPI) {
 			const task = nextReadyTask(run.graph);
 			if (!task) {
 				if (run.graph.tasks.every((candidate) => candidate.status === "passed")) {
+					run.dashboard?.addActivity("All tasks passed verification");
 					run.graph.status = "completed";
 					await saveTaskGraph(run.paths.tasks, run.graph);
 					await runAudit(run);
@@ -308,6 +366,8 @@ export default function planExecutionExtension(pi: ExtensionAPI) {
 				return;
 			}
 			run.ctx.ui.setStatus(STATUS_KEY, `${task.id}: implementing (${task.attempts}/2)`);
+			run.dashboard?.setPhase("worker", run.graph, task);
+			run.dashboard?.addActivity(`${task.id}: starting implementation attempt ${task.attempts}/2`);
 			const worker = await runPi({
 				cwd: run.ctx.cwd,
 				prompt: workerPrompt(run.graph.sourcePlan, run.graph, task),
@@ -317,6 +377,7 @@ export default function planExecutionExtension(pi: ExtensionAPI) {
 				extensions: [WORKER_GUARD],
 				env: { PI_PLAN_PROTECTED_PATHS: JSON.stringify(snapshots.map((snapshot) => snapshot.path)) },
 				signal: run.abort.signal,
+				onEvent: (event) => run.dashboard?.handlePiEvent(event),
 			});
 			const changed = await restoreChangedFiles(snapshots);
 
@@ -335,12 +396,21 @@ export default function planExecutionExtension(pi: ExtensionAPI) {
 				} else {
 					run.phase = "verification";
 					run.ctx.ui.setStatus(STATUS_KEY, `${task.id}: verifying`);
-					const verification = await runVerification(task.verification, run.ctx.cwd, run.abort.signal);
+					run.dashboard?.setPhase("verification", run.graph, task);
+					run.dashboard?.setVerification(task.verification);
+					run.dashboard?.addActivity(`${task.id}: running verification`);
+					const verification = await runVerification(
+						task.verification,
+						run.ctx.cwd,
+						run.abort.signal,
+						600_000,
+						(stream, chunk) => run.dashboard?.appendVerificationOutput(stream, chunk),
+					);
+					const delayedChanges = await restoreChangedFiles(snapshots);
 					if (run.stopRequested || verification.aborted && !verification.timedOut) {
 						await pauseTask(run, task);
 						return;
 					}
-					const delayedChanges = await restoreChangedFiles(snapshots);
 					if (delayedChanges.length > 0) {
 						result = applyAttemptResult(task, evidence(task, "integrity", 1, `Protected files changed after worker exit:\n${delayedChanges.join("\n")}`), false);
 					} else {
@@ -350,7 +420,12 @@ export default function planExecutionExtension(pi: ExtensionAPI) {
 				}
 			}
 			run.abort = undefined;
-			if (result === "failed") run.graph.status = "failed";
+			if (result === "passed") run.dashboard?.addActivity(`${task.id}: verification passed`);
+			if (result === "retry") run.dashboard?.addActivity(`${task.id}: attempt failed; preparing repair attempt`);
+			if (result === "failed") {
+				run.graph.status = "failed";
+				run.dashboard?.addActivity(`${task.id}: failed after two attempts`);
+			}
 			await saveTaskGraph(run.paths.tasks, run.graph);
 			if (result === "failed") {
 				report(run.ctx, `${task.id} failed after two attempts`, "error");
@@ -385,6 +460,23 @@ export default function planExecutionExtension(pi: ExtensionAPI) {
 			run.ctx.ui.setStatus(STATUS_KEY, undefined);
 			if (active === run) active = undefined;
 		});
+
+		if (ctx.mode === "tui") {
+			try {
+				await ctx.ui.custom<void>((tui, theme, _keybindings, done) => {
+					run.dashboard = new PlanDashboard(tui, theme, graph.sourcePlan, "worker", () => {
+						run.stopRequested = true;
+						run.abort?.abort();
+					});
+					run.dashboard.setPhase("worker", graph);
+					run.dashboard.addActivity("Starting approved plan");
+					run.done.finally(done);
+					return run.dashboard;
+				});
+			} catch (error: unknown) {
+				report(ctx, `Progress dashboard closed: ${error instanceof Error ? error.message : String(error)}`, "warning");
+			}
+		}
 	}
 
 	pi.registerCommand("execute-plan", {
@@ -452,9 +544,10 @@ export default function planExecutionExtension(pi: ExtensionAPI) {
 				graph.baseline = baseline;
 				await saveTaskGraph(paths.tasks, graph);
 				report(ctx, "Plan approved. Keep this checkout read-only while workers run.", "warning");
+				planningAbort = undefined;
 				await startExecution(ctx, paths, graph);
 			} catch (error: unknown) {
-				if (!planningAbort.signal.aborted) report(ctx, error instanceof Error ? error.message : String(error), "error");
+				if (!planningAbort?.signal.aborted) report(ctx, error instanceof Error ? error.message : String(error), "error");
 			} finally {
 				planningAbort = undefined;
 				if (!active) ctx.ui.setStatus(STATUS_KEY, undefined);

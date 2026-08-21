@@ -2,6 +2,7 @@ import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { chmod, lstat, mkdir, readFile, realpath, rename, rm, writeFile } from "node:fs/promises";
 import { basename, dirname, extname, join, resolve } from "node:path";
+import { StringDecoder } from "node:string_decoder";
 
 const RUN_STATUSES = new Set(["approved", "running", "paused", "completed", "failed"]);
 const TASK_STATUSES = new Set(["pending", "running", "passed", "failed"]);
@@ -63,6 +64,8 @@ export type PiResult = ProcessResult & {
 	stopReason?: string;
 	errorMessage?: string;
 };
+
+export type ProcessOutputHandler = (stream: "stdout" | "stderr", chunk: string) => void;
 
 function object(value: unknown, label: string): Record<string, unknown> {
 	if (typeof value !== "object" || value === null || Array.isArray(value)) throw new Error(`${label} must be an object`);
@@ -315,7 +318,15 @@ function processGroupExists(pid: number | undefined): boolean {
 async function captureProcess(
 	command: string,
 	args: string[],
-	options: { cwd: string; env?: NodeJS.ProcessEnv; shell?: boolean; signal?: AbortSignal; timeoutMs?: number },
+	options: {
+		cwd: string;
+		env?: NodeJS.ProcessEnv;
+		shell?: boolean;
+		signal?: AbortSignal;
+		timeoutMs?: number;
+		onStdoutLine?: (line: string) => void;
+		onOutput?: ProcessOutputHandler;
+	},
 ): Promise<ProcessResult> {
 	return new Promise((resolveResult) => {
 		const child = spawn(command, args, {
@@ -327,18 +338,37 @@ async function captureProcess(
 		});
 		let stdout = Buffer.alloc(0);
 		let stderr = Buffer.alloc(0);
+		let stdoutLine = "";
 		let aborted = false;
 		let timedOut = false;
 		let settled = false;
 		let killTimer: NodeJS.Timeout | undefined;
 		let timeout: NodeJS.Timeout | undefined;
+		const stdoutDecoder = new StringDecoder("utf8");
+		const stderrDecoder = new StringDecoder("utf8");
 
 		const append = (current: Buffer, chunk: Buffer): Buffer => {
 			const combined = Buffer.concat([current, chunk]);
 			return combined.length > OUTPUT_LIMIT ? combined.subarray(combined.length - OUTPUT_LIMIT) : combined;
 		};
-		child.stdout?.on("data", (chunk: Buffer) => { stdout = append(stdout, chunk); });
-		child.stderr?.on("data", (chunk: Buffer) => { stderr = append(stderr, chunk); });
+		const emitOutput = (stream: "stdout" | "stderr", text: string) => {
+			if (!text) return;
+			try { options.onOutput?.(stream, text); } catch { /* Observers cannot change process results. */ }
+			if (stream !== "stdout" || !options.onStdoutLine) return;
+			const lines = `${stdoutLine}${text}`.split("\n");
+			stdoutLine = lines.pop() ?? "";
+			for (const line of lines) {
+				try { options.onStdoutLine(line.replace(/\r$/, "")); } catch { /* Observers cannot change process results. */ }
+			}
+		};
+		child.stdout?.on("data", (chunk: Buffer) => {
+			stdout = append(stdout, chunk);
+			emitOutput("stdout", stdoutDecoder.write(chunk));
+		});
+		child.stderr?.on("data", (chunk: Buffer) => {
+			stderr = append(stderr, chunk);
+			emitOutput("stderr", stderrDecoder.write(chunk));
+		});
 
 		const terminate = (fromTimeout = false) => {
 			if (settled) return;
@@ -353,8 +383,19 @@ async function captureProcess(
 		if (options.timeoutMs) timeout = setTimeout(() => terminate(true), options.timeoutMs);
 
 		child.on("error", (error) => { stderr = append(stderr, Buffer.from(error.message)); });
+		child.on("exit", () => {
+			if (!processGroupExists(child.pid)) return;
+			killProcess(child, "SIGTERM");
+			killTimer ??= setTimeout(() => killProcess(child, "SIGKILL"), 100);
+		});
 		child.on("close", (code) => {
 			settled = true;
+			emitOutput("stdout", stdoutDecoder.end());
+			emitOutput("stderr", stderrDecoder.end());
+			if (stdoutLine && options.onStdoutLine) {
+				try { options.onStdoutLine(stdoutLine.replace(/\r$/, "")); } catch { /* Observers cannot change process results. */ }
+				stdoutLine = "";
+			}
 			const finish = () => {
 				if (timeout) clearTimeout(timeout);
 				if (killTimer) clearTimeout(killTimer);
@@ -395,6 +436,7 @@ export async function runPi(options: {
 	extensions?: string[];
 	env?: NodeJS.ProcessEnv;
 	signal?: AbortSignal;
+	onEvent?: (event: unknown) => void;
 }): Promise<PiResult> {
 	const args = ["--mode", "json", "-p", "--no-session", "--no-extensions", "--model", options.model];
 	if (options.thinkingLevel) args.push("--thinking", options.thinkingLevel);
@@ -407,6 +449,9 @@ export async function runPi(options: {
 		cwd: options.cwd,
 		env: { ...process.env, ...options.env },
 		signal: options.signal,
+		onStdoutLine: options.onEvent ? (line) => {
+			try { options.onEvent?.(JSON.parse(line) as unknown); } catch { /* Ignore incomplete, non-JSON, or observer failures. */ }
+		} : undefined,
 	});
 
 	let output = "";
@@ -428,6 +473,12 @@ export async function runPi(options: {
 	return { ...result, output, stopReason, errorMessage };
 }
 
-export async function runVerification(command: string, cwd: string, signal?: AbortSignal, timeoutMs = 600_000): Promise<ProcessResult> {
-	return captureProcess(command, [], { cwd, shell: true, signal, timeoutMs });
+export async function runVerification(
+	command: string,
+	cwd: string,
+	signal?: AbortSignal,
+	timeoutMs = 600_000,
+	onOutput?: ProcessOutputHandler,
+): Promise<ProcessResult> {
+	return captureProcess(command, [], { cwd, shell: true, signal, timeoutMs, onOutput });
 }
