@@ -1,5 +1,5 @@
 import { access, readFile, realpath, writeFile } from "node:fs/promises";
-import { relative, resolve } from "node:path";
+import { isAbsolute, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import {
@@ -96,7 +96,7 @@ ${dependencies ? `\nCompleted dependencies:\n${dependencies}` : ""}
 ${previousFailure ? `\nPrevious attempt failed:\n${previousFailure.output}` : ""}`;
 }
 
-function auditPrompt(plan: string, graph: TaskGraph, finalStatus: string, finalDiff: string): string {
+function auditPrompt(plan: string, graph: TaskGraph, finalStatus: string, finalDiff: string, controllerFiles: string[]): string {
 	return `You are a fresh read-only final auditor. Compare the source plan, approved task graph, verification evidence, and repository state. Do not modify files. Report concise findings under severity headings. If no problems are found, say so.
 
 Check for:
@@ -105,6 +105,9 @@ Check for:
 - Missing wiring or dead implementations.
 - Unplanned scope changes.
 - Claims unsupported by verification evidence.
+
+The following files are owned by the controller. Do not attribute their presence or changes to workers:
+${controllerFiles.map((path) => `- ${path}`).join("\n")}
 
 <source-plan>\n${plan}\n</source-plan>
 <task-graph>\n${JSON.stringify(graph, null, 2)}\n</task-graph>
@@ -132,7 +135,7 @@ async function fileExists(path: string): Promise<boolean> {
 
 async function gitState(cwd: string): Promise<{ gitStatus: string; gitDiff: string }> {
 	const [status, working, staged] = await Promise.all([
-		runVerification("git status --short", cwd, undefined, 10_000),
+		runVerification("git status --short --untracked-files=all", cwd, undefined, 10_000),
 		runVerification("git diff --no-ext-diff", cwd, undefined, 10_000),
 		runVerification("git diff --cached --no-ext-diff", cwd, undefined, 10_000),
 	]);
@@ -144,6 +147,22 @@ async function gitState(cwd: string): Promise<{ gitStatus: string; gitDiff: stri
 		gitStatus: status.code === 0 ? boundedOutput(status.stdout) : "",
 		gitDiff: boundedOutput(diff),
 	};
+}
+
+function shellQuote(value: string): string {
+	return `'${value.replaceAll("'", `'"'"'`)}'`;
+}
+
+async function gitStatusWithout(cwd: string, paths: string[]): Promise<string> {
+	const canonicalCwd = await realpath(cwd).catch(() => cwd);
+	const exclusions = paths.flatMap((path) => {
+		const local = relative(canonicalCwd, path);
+		if (!local || isAbsolute(local) || local === ".." || local.startsWith(`..${sep}`)) return [];
+		return [shellQuote(`:(exclude)${local.split(sep).join("/")}`)];
+	});
+	const pathspec = exclusions.length ? ` -- . ${exclusions.join(" ")}` : "";
+	const status = await runVerification(`git status --short --untracked-files=all${pathspec}`, cwd, undefined, 10_000);
+	return status.code === 0 ? boundedOutput(status.stdout) : "";
 }
 
 function evidence(task: PlanTask, kind: TaskEvidence["kind"], exitCode: number, output: string, command?: string): TaskEvidence {
@@ -327,7 +346,11 @@ export default function planExecutionExtension(pi: ExtensionAPI) {
 		const [plan, final] = await Promise.all([readFile(run.paths.sourcePlan, "utf8"), gitState(run.ctx.cwd)]);
 		const result = await runPi({
 			cwd: run.ctx.cwd,
-			prompt: auditPrompt(plan, run.graph, final.gitStatus, final.gitDiff),
+			prompt: auditPrompt(plan, run.graph, final.gitStatus, final.gitDiff, [
+				relative(run.ctx.cwd, run.paths.sourcePlan),
+				relative(run.ctx.cwd, run.paths.tasks),
+				relative(run.ctx.cwd, run.paths.audit),
+			]),
 			model: modelName(run.ctx),
 			thinkingLevel: run.ctx.thinkingLevel,
 			tools: READ_ONLY_TOOLS,
@@ -577,7 +600,9 @@ export default function planExecutionExtension(pi: ExtensionAPI) {
 			try {
 				const graph = await planAndApprove(ctx, sourcePath, storedSourcePath, paths.tasks, baseline, existing, reviewDraft);
 				if (!graph) return;
-				if (graph.baseline.gitStatus && !await ctx.ui.confirm("Dirty worktree", `Existing changes will be recorded for the auditor:\n\n${graph.baseline.gitStatus}\n\nContinue?`)) return;
+				graph.baseline = await gitState(ctx.cwd);
+				const dirtyStatus = await gitStatusWithout(ctx.cwd, [paths.sourcePlan, paths.tasks, paths.audit]);
+				if (dirtyStatus && !await ctx.ui.confirm("Dirty worktree", `Existing changes will be recorded for the auditor:\n\n${dirtyStatus}\n\nContinue?`)) return;
 				await saveTaskGraph(paths.tasks, graph);
 				report(ctx, "Plan approved. Keep this checkout read-only while workers run.", "warning");
 				planningAbort = undefined;

@@ -172,7 +172,7 @@ pending → running → passed
                   ↘ failed
 ```
 
-Store the dirty-worktree baseline at the graph's top level. Store each verification command, exit code, and bounded output as task completion evidence.
+Store the complete dirty-worktree baseline at the graph's top level, expanding untracked directories into individual files. The approval warning may hide the exact source plan, task graph, and audit paths, but they remain in baseline evidence and are identified to the auditor as controller-owned files. Store each verification command, exit code, and bounded output as task completion evidence.
 
 ## Execution
 

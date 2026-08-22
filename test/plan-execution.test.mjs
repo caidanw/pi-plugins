@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { chmod, link, mkdtemp, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
+import { chmod, link, mkdir, mkdtemp, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -270,6 +270,66 @@ console.log(JSON.stringify({ type: "tool_execution_end", toolCallId: "submit", t
 	await second.commands.get("execute-plan").handler("plan.md", second.ctx);
 	assert.deepEqual(offeredChoices, ["Review draft", "Regenerate", "Cancel"]);
 	assert.equal(await readFile(countPath, "utf8"), "2");
+});
+
+test("dirty warning hides controller files while the audit baseline keeps every file", async (t) => {
+	const directory = await temporaryDirectory(t);
+	const docs = join(directory, "docs");
+	const planPath = join(docs, "plan.md");
+	const tasksPath = join(docs, "plan.tasks.json");
+	const fakePi = join(directory, "fake-pi.mjs");
+	await runVerification("git init -q", directory, undefined, 10_000);
+	await runVerification("git config user.email test@example.com && git config user.name Test", directory, undefined, 10_000);
+	await writeFile(join(directory, "tracked.txt"), "tracked\n");
+	await runVerification("git add tracked.txt && git commit -qm initial", directory, undefined, 10_000);
+	await mkdir(docs, { recursive: true });
+	await writeFile(planPath, "# Plan\n");
+	await writeFile(join(docs, "parked.md"), "# Parked\n");
+	await writeFile(fakePi, `#!/usr/bin/env node
+import { writeFileSync } from "node:fs";
+import { join } from "node:path";
+const prompt = process.argv.at(-1) ?? "";
+const emit = (text) => console.log(JSON.stringify({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text }], stopReason: "end" } }));
+if (prompt.includes("read-only implementation planner")) console.log(JSON.stringify({ type: "tool_execution_end", toolCallId: "submit", toolName: "submit_task_graph", result: { content: [], details: { tasks: [{ id: "T001", title: "Test", instructions: "Test", acceptance: ["It works"], dependsOn: [], expectedFiles: [], verification: "true" }] } }, isError: false }));
+else if (prompt.includes("implementation worker")) emit("done");
+else if (prompt.includes("fresh read-only final auditor")) { writeFileSync(join(process.cwd(), "audit-prompt.txt"), prompt); emit("No findings."); }
+else process.exit(2);
+`);
+	await chmod(fakePi, 0o755);
+	useFakePi(t, fakePi);
+
+	let dirtyMessage = "";
+	const ui = {
+		confirm: async (title, message) => {
+			if (title === "Dirty worktree") dirtyMessage = message;
+			return true;
+		},
+		custom: (factory) => new Promise((resolve) => {
+			let component;
+			const done = (value) => {
+				component?.dispose?.();
+				resolve(value);
+			};
+			component = factory(
+				{ terminal: { rows: 40 }, requestRender() {} },
+				{ fg: (_color, text) => text, bold: (text) => text },
+				{ matches: () => false },
+				done,
+			);
+			if (component instanceof TaskReview) component.handleInput("a");
+		}),
+	};
+	const { commands, ctx } = extensionHarness(directory, "Approve and run", { mode: "tui", ui });
+	await commands.get("execute-plan").handler("docs/plan.md", ctx);
+
+	assert.match(dirtyMessage, /docs\/parked\.md/);
+	assert.doesNotMatch(dirtyMessage, /docs\/plan(?:\.tasks)?\.json|docs\/plan\.md/);
+	const completed = await loadTaskGraph(tasksPath);
+	assert.match(completed.baseline.gitStatus, /docs\/plan\.md/);
+	assert.match(completed.baseline.gitStatus, /docs\/plan\.tasks\.json/);
+	assert.match(completed.baseline.gitStatus, /docs\/parked\.md/);
+	const auditPrompt = await readFile(join(directory, "audit-prompt.txt"), "utf8");
+	assert.match(auditPrompt, /controller[\s\S]*docs\/plan\.md[\s\S]*docs\/plan\.tasks\.json[\s\S]*docs\/plan\.audit\.md/i);
 });
 
 test("streams split Pi JSON events without letting observers change results", async (t) => {
@@ -596,6 +656,7 @@ if (prompt.includes("read-only implementation planner")) {
 	assert.equal(await readFile(join(directory, "worker-count.txt"), "utf8"), "2");
 	assert.match(await readFile(join(directory, "plan.audit.md"), "utf8"), /No findings/);
 	assert.match(await readFile(join(directory, "audit-prompt.txt"), "utf8"), /## Staged[\s\S]*staged baseline/);
+	assert.match(await readFile(join(directory, "audit-prompt.txt"), "utf8"), /controller-owned-files|owned by the controller/i);
 
 	const reloaded = extensionHarness(directory, "Approve and run");
 	await reloaded.commands.get("execute-plan").handler("plan.md", reloaded.ctx);
