@@ -1,4 +1,5 @@
 import type { Theme } from "@earendil-works/pi-coding-agent";
+import { truncateToWidth } from "@earendil-works/pi-tui";
 import type { PlanTask, TaskGraph } from "./core.ts";
 
 export type DashboardPhase = "planning" | "worker" | "verification" | "audit";
@@ -49,8 +50,7 @@ export function activityFromPiEvent(value: unknown): string | undefined {
 }
 
 function clip(value: string, width: number): string {
-	if (width < 2) return "";
-	return value.length <= width ? value : `${value.slice(0, width - 1)}…`;
+	return truncateToWidth(value, Math.max(0, width), "…");
 }
 
 function elapsed(startedAt: number): string {
@@ -187,7 +187,7 @@ export class PlanDashboard {
 		lines.push(this.cancelArmedUntil >= Date.now()
 			? this.theme.fg("warning", "⚠ Press Esc again within 2 seconds to pause and exit")
 			: this.theme.fg("dim", "Esc pause/stop and exit"));
-		return lines;
+		return lines.map((line) => truncateToWidth(line, width, "…"));
 	}
 
 	invalidate(): void {

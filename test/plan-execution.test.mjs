@@ -3,6 +3,7 @@ import { chmod, link, mkdtemp, readFile, rename, rm, stat, writeFile } from "nod
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { visibleWidth } from "@earendil-works/pi-tui";
 import planExecutionExtension from "../extensions/plan-execution.ts";
 import planWorkerGuard from "../extensions/plan-execution/worker-guard.ts";
 import plannerSubmit from "../extensions/plan-execution/planner-submit.ts";
@@ -135,6 +136,8 @@ test("dashboard bounds activity history and confirms cancellation", async () => 
 	const dashboard = new PlanDashboard(tui, theme, "plan.md", "planning", () => { cancellations++; }, 10, (data) => data === "kitty-escape");
 	for (let index = 0; index < 205; index++) dashboard.addActivity(`Activity ${index}`);
 	assert.match(dashboard.render(100).join("\n"), /176 earlier activities/);
+	dashboard.addActivity("分析中 🚀".repeat(20));
+	assert.ok(dashboard.render(20).every((line) => visibleWidth(line) <= 20));
 
 	dashboard.handleInput("kitty-escape");
 	await new Promise((resolve) => setTimeout(resolve, 20));

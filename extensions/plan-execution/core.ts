@@ -455,7 +455,7 @@ export async function runPi(options: {
 	signal?: AbortSignal;
 	onEvent?: (event: unknown) => void;
 }): Promise<PiResult> {
-	const args = ["--mode", "json", "-p", "--no-session", "--no-extensions", "--model", options.model];
+	const args = ["--mode", "json", "--no-session", "--no-extensions", "--model", options.model];
 	if (options.thinkingLevel) args.push("--thinking", options.thinkingLevel);
 	if (options.tools.length > 0) args.push("--tools", options.tools.join(","));
 	else args.push("--no-tools");
