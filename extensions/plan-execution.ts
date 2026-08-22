@@ -6,11 +6,10 @@ import {
 	applyAttemptResult,
 	boundedOutput,
 	captureProtectedFiles,
-	initializeGraph,
 	loadTaskGraph,
 	nextReadyTask,
 	normalizeForResume,
-	parseTaskGraph,
+	parsePlannerTaskGraph,
 	planPaths,
 	restoreChangedFiles,
 	runPi,
@@ -25,6 +24,8 @@ import { PlanDashboard, type DashboardPhase } from "./plan-execution/ui.ts";
 const READ_ONLY_TOOLS = ["read", "grep", "find", "ls"];
 const WORKER_TOOLS = ["read", "bash", "edit", "write", "grep", "find", "ls"];
 const WORKER_GUARD = fileURLToPath(new URL("./plan-execution/worker-guard.ts", import.meta.url));
+const PLANNER_SUBMIT = fileURLToPath(new URL("./plan-execution/planner-submit.ts", import.meta.url));
+const SUBMIT_TASK_GRAPH = "submit_task_graph";
 const STATUS_KEY = "plan-execution";
 
 type ActiveRun = {
@@ -44,12 +45,6 @@ function modelName(ctx: ExtensionCommandContext): string {
 	return `${ctx.model.provider}/${ctx.model.id}`;
 }
 
-function cleanJsonOutput(output: string): string {
-	const trimmed = output.trim();
-	const fenced = trimmed.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/i);
-	return fenced?.[1] ?? trimmed;
-}
-
 function reviewText(graph: TaskGraph): string {
 	return graph.tasks.map((task) => [
 		`${task.id}: ${task.title}`,
@@ -63,25 +58,7 @@ function reviewText(graph: TaskGraph): string {
 function plannerPrompt(sourcePlan: string, plan: string, current?: TaskGraph, feedback?: string): string {
 	return `You are a read-only implementation planner. Convert the source Markdown plan into the smallest complete sequentially-executable task DAG. Inspect the repository only as needed. Do not modify files.
 
-Output exactly one JSON object and no commentary. Use this shape:
-{
-  "version": 1,
-  "sourcePlan": ${JSON.stringify(sourcePlan)},
-  "status": "approved",
-  "baseline": { "gitStatus": "", "gitDiff": "" },
-  "tasks": [{
-    "id": "T001",
-    "title": "Short title",
-    "instructions": "Bounded implementation instructions",
-    "acceptance": ["Observable criterion"],
-    "dependsOn": [],
-    "expectedFiles": ["path"],
-    "verification": "one non-interactive shell command",
-    "status": "pending",
-    "attempts": 0,
-    "evidence": []
-  }]
-}
+Submit the completed DAG with the submit_task_graph tool exactly once as your final action. Do not return the graph as prose or JSON text.
 
 Rules:
 - Include every source-plan requirement exactly once.
@@ -195,8 +172,8 @@ export default function planExecutionExtension(pi: ExtensionAPI) {
 		let pending: Promise<T> | undefined;
 		let result: T | undefined;
 		try {
-			result = await ctx.ui.custom<T | undefined>((tui, theme, _keybindings, done) => {
-				const dashboard = new PlanDashboard(tui, theme, sourcePlan, phase, onCancel);
+			result = await ctx.ui.custom<T | undefined>((tui, theme, keybindings, done) => {
+				const dashboard = new PlanDashboard(tui, theme, sourcePlan, phase, onCancel, 2_000, (data) => keybindings.matches(data, "tui.select.cancel"));
 				dashboard.addActivity("Inspecting the source plan and repository");
 				pending = work(dashboard);
 				pending.then(done).catch((error: unknown) => {
@@ -238,22 +215,35 @@ export default function planExecutionExtension(pi: ExtensionAPI) {
 		feedback?: string,
 	): Promise<TaskGraph> {
 		const prompt = plannerPrompt(storedSourcePath, await readFile(sourcePath, "utf8"), current, feedback);
+		let submission: unknown;
+		let submissionCount = 0;
 		const plan = (dashboard?: PlanDashboard) => runPi({
 			cwd: ctx.cwd,
 			prompt,
 			model: modelName(ctx),
 			thinkingLevel: ctx.thinkingLevel,
-			tools: READ_ONLY_TOOLS,
+			tools: [...READ_ONLY_TOOLS, SUBMIT_TASK_GRAPH],
+			extensions: [PLANNER_SUBMIT],
 			signal: planningAbort?.signal,
-			onEvent: dashboard ? (event) => dashboard.handlePiEvent(event) : undefined,
+			onEvent: (event) => {
+				dashboard?.handlePiEvent(event);
+				if (typeof event !== "object" || event === null) return;
+				const candidate = event as { type?: unknown; toolName?: unknown; isError?: unknown; result?: unknown };
+				if (candidate.type !== "tool_execution_end" || candidate.toolName !== SUBMIT_TASK_GRAPH || candidate.isError === true) return;
+				if (typeof candidate.result !== "object" || candidate.result === null) return;
+				const details = (candidate.result as { details?: unknown }).details;
+				if (details === undefined) return;
+				submission = details;
+				submissionCount++;
+			},
 		});
 		const result = ctx.mode === "tui"
 			? await withDashboard(ctx, storedSourcePath, "planning", () => planningAbort?.abort(), plan)
 			: await plan();
 		const failure = piFailure(result);
 		if (failure) throw new Error(`Planner failed: ${failure}`);
-		if (!result.output.trim()) throw new Error("Planner returned no task graph");
-		return initializeGraph(parseTaskGraph(JSON.parse(cleanJsonOutput(result.output)) as unknown), storedSourcePath);
+		if (submissionCount !== 1) throw new Error(`Planner submitted ${submissionCount} task graphs; expected exactly one`);
+		return parsePlannerTaskGraph(submission, storedSourcePath);
 	}
 
 	async function planAndApprove(
@@ -463,11 +453,11 @@ export default function planExecutionExtension(pi: ExtensionAPI) {
 
 		if (ctx.mode === "tui") {
 			try {
-				await ctx.ui.custom<void>((tui, theme, _keybindings, done) => {
+				await ctx.ui.custom<void>((tui, theme, keybindings, done) => {
 					run.dashboard = new PlanDashboard(tui, theme, graph.sourcePlan, "worker", () => {
 						run.stopRequested = true;
 						run.abort?.abort();
-					});
+					}, 2_000, (data) => keybindings.matches(data, "tui.select.cancel"));
 					run.dashboard.setPhase("worker", graph);
 					run.dashboard.addActivity("Starting approved plan");
 					run.done.finally(done);

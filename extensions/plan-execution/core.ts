@@ -177,6 +177,23 @@ export function initializeGraph(graph: TaskGraph, sourcePlan: string): TaskGraph
 	return initialized;
 }
 
+export function parsePlannerTaskGraph(value: unknown, sourcePlan: string): TaskGraph {
+	const input = object(value, "planner submission");
+	if (!Array.isArray(input.tasks)) throw new Error("planner submission.tasks must be an array");
+	return parseTaskGraph({
+		version: 1,
+		sourcePlan,
+		status: "approved",
+		baseline: { gitStatus: "", gitDiff: "" },
+		tasks: input.tasks.map((task, index) => ({
+			...object(task, `planner submission.tasks[${index}]`),
+			status: "pending",
+			attempts: 0,
+			evidence: [],
+		})),
+	});
+}
+
 export function normalizeForResume(graph: TaskGraph): TaskGraph {
 	const normalized = structuredClone(graph);
 	let recovered = false;
@@ -445,31 +462,30 @@ export async function runPi(options: {
 	for (const extension of options.extensions ?? []) args.push("--extension", extension);
 	args.push(options.prompt);
 	const invocation = piInvocation(args);
+	let output = "";
+	let stopReason: string | undefined;
+	let errorMessage: string | undefined;
 	const result = await captureProcess(invocation.command, invocation.args, {
 		cwd: options.cwd,
 		env: { ...process.env, ...options.env },
 		signal: options.signal,
-		onStdoutLine: options.onEvent ? (line) => {
-			try { options.onEvent?.(JSON.parse(line) as unknown); } catch { /* Ignore incomplete, non-JSON, or observer failures. */ }
-		} : undefined,
+		onStdoutLine: (line) => {
+			let event: unknown;
+			try { event = JSON.parse(line) as unknown; } catch { return; }
+			if (typeof event === "object" && event !== null) {
+				const candidate = event as { type?: unknown; message?: unknown };
+				if (candidate.type === "message_end" && typeof candidate.message === "object" && candidate.message !== null) {
+					const message = candidate.message as { role?: unknown; content?: unknown; stopReason?: unknown; errorMessage?: unknown };
+					if (message.role === "assistant") {
+						output = messageText(message.content);
+						if (typeof message.stopReason === "string") stopReason = message.stopReason;
+						if (typeof message.errorMessage === "string") errorMessage = message.errorMessage;
+					}
+				}
+			}
+			try { options.onEvent?.(event); } catch { /* Observers cannot change process results. */ }
+		},
 	});
-
-	let output = "";
-	let stopReason: string | undefined;
-	let errorMessage: string | undefined;
-	for (const line of result.stdout.split("\n")) {
-		try {
-			const event = JSON.parse(line) as { type?: unknown; message?: unknown };
-			if (event.type !== "message_end" || typeof event.message !== "object" || event.message === null) continue;
-			const message = event.message as { role?: unknown; content?: unknown; stopReason?: unknown; errorMessage?: unknown };
-			if (message.role !== "assistant") continue;
-			output = messageText(message.content);
-			if (typeof message.stopReason === "string") stopReason = message.stopReason;
-			if (typeof message.errorMessage === "string") errorMessage = message.errorMessage;
-		} catch {
-			// Ignore non-JSON process output.
-		}
-	}
 	return { ...result, output, stopReason, errorMessage };
 }
 

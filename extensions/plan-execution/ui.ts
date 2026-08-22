@@ -75,6 +75,7 @@ export class PlanDashboard {
 	private readonly sourcePlan: string;
 	private readonly onCancel: () => void;
 	private readonly cancelWindowMs: number;
+	private readonly isCancel: (data: string) => boolean;
 	private phase: DashboardPhase;
 	private graph?: TaskGraph;
 	private task?: PlanTask;
@@ -91,6 +92,7 @@ export class PlanDashboard {
 		phase: DashboardPhase,
 		onCancel: () => void,
 		cancelWindowMs = 2_000,
+		isCancel: (data: string) => boolean = (data) => data === "\x1b",
 	) {
 		this.tui = tui;
 		this.theme = theme;
@@ -98,6 +100,7 @@ export class PlanDashboard {
 		this.phase = phase;
 		this.onCancel = onCancel;
 		this.cancelWindowMs = cancelWindowMs;
+		this.isCancel = isCancel;
 		this.tickTimer = setInterval(() => this.renderSoon(), 1_000);
 	}
 
@@ -138,7 +141,7 @@ export class PlanDashboard {
 	}
 
 	handleInput(data: string): void {
-		if (data !== "\x1b") return;
+		if (!this.isCancel(data)) return;
 		const now = Date.now();
 		if (this.cancelArmedUntil >= now) {
 			this.cancelArmedUntil = 0;

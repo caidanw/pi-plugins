@@ -5,6 +5,7 @@ import { join } from "node:path";
 import test from "node:test";
 import planExecutionExtension from "../extensions/plan-execution.ts";
 import planWorkerGuard from "../extensions/plan-execution/worker-guard.ts";
+import plannerSubmit from "../extensions/plan-execution/planner-submit.ts";
 import {
 	applyAttemptResult,
 	captureProtectedFiles,
@@ -102,6 +103,24 @@ function useFakePi(t, path) {
 	});
 }
 
+test("planner submits one terminating structured task graph", async () => {
+	let tool;
+	plannerSubmit({ registerTool(definition) { tool = definition; } });
+	const tasks = [{
+		id: "T001",
+		title: "Test",
+		instructions: "Implement it",
+		acceptance: ["It works"],
+		dependsOn: [],
+		expectedFiles: ["test.txt"],
+		verification: "true",
+	}];
+
+	const result = await tool.execute("call", { tasks });
+	assert.equal(result.terminate, true);
+	assert.deepEqual(result.details, { tasks });
+});
+
 test("turns known Pi tool events into concise activity text", () => {
 	assert.equal(activityFromPiEvent({ type: "tool_execution_start", toolName: "read", args: { path: "src/app.ts" } }), "Reading src/app.ts");
 	assert.equal(activityFromPiEvent({ type: "tool_execution_start", toolName: "grep", args: { pattern: "parse", path: "test/" } }), "Searching test/ for parse");
@@ -113,15 +132,15 @@ test("dashboard bounds activity history and confirms cancellation", async () => 
 	let cancellations = 0;
 	const tui = { terminal: { rows: 80 }, requestRender() {} };
 	const theme = { fg: (_color, text) => text, bold: (text) => text };
-	const dashboard = new PlanDashboard(tui, theme, "plan.md", "planning", () => { cancellations++; }, 10);
+	const dashboard = new PlanDashboard(tui, theme, "plan.md", "planning", () => { cancellations++; }, 10, (data) => data === "kitty-escape");
 	for (let index = 0; index < 205; index++) dashboard.addActivity(`Activity ${index}`);
 	assert.match(dashboard.render(100).join("\n"), /176 earlier activities/);
 
-	dashboard.handleInput("\x1b");
+	dashboard.handleInput("kitty-escape");
 	await new Promise((resolve) => setTimeout(resolve, 20));
-	dashboard.handleInput("\x1b");
+	dashboard.handleInput("kitty-escape");
 	assert.equal(cancellations, 0);
-	dashboard.handleInput("\x1b");
+	dashboard.handleInput("kitty-escape");
 	assert.equal(cancellations, 1);
 	dashboard.dispose();
 });
@@ -131,13 +150,13 @@ test("streams split Pi JSON events without letting observers change results", as
 	const fakePi = join(directory, "fake-pi.mjs");
 	const event = JSON.stringify({ type: "tool_execution_start", toolCallId: "1", toolName: "read", args: { path: "plan.md" } });
 	const final = JSON.stringify({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "done" }], stopReason: "end" } });
-	await writeFile(fakePi, `#!/usr/bin/env node\nconst event = ${JSON.stringify(event)};\nprocess.stdout.write(event.slice(0, 20));\nsetTimeout(() => process.stdout.write(event.slice(20) + "\\n" + ${JSON.stringify(final)} + "\\n"), 10);\n`);
+	await writeFile(fakePi, `#!/usr/bin/env node\nconst event = ${JSON.stringify(event)};\nconst trailing = JSON.stringify({ type: "agent_end", messages: ["x".repeat(60_000)] });\nprocess.stdout.write(event.slice(0, 20));\nsetTimeout(() => process.stdout.write(event.slice(20) + "\\n" + ${JSON.stringify(final)} + "\\n" + trailing + "\\n"), 10);\n`);
 	await chmod(fakePi, 0o755);
 	useFakePi(t, fakePi);
 	const events = [];
 
 	const result = await runPi({ cwd: directory, prompt: "test", model: "fake/model", tools: [], onEvent(event) { events.push(event); throw new Error("UI failed"); } });
-	assert.equal(events.length, 2);
+	assert.equal(events.length, 3);
 	assert.equal(events[0].type, "tool_execution_start");
 	assert.equal(result.output, "done");
 	assert.equal(result.code, 0);
@@ -150,7 +169,8 @@ test("dashboard lifecycle failures do not stop planning or execution", async (t)
 	await writeFile(fakePi, `#!/usr/bin/env node
 const prompt = process.argv.at(-1) ?? "";
 const emit = (text) => console.log(JSON.stringify({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text }], stopReason: "end" } }));
-if (prompt.includes("read-only implementation planner")) setTimeout(() => emit(JSON.stringify(${JSON.stringify(graph())})), 20);
+const submit = (details) => console.log(JSON.stringify({ type: "tool_execution_end", toolCallId: "submit", toolName: "submit_task_graph", result: { content: [], details }, isError: false }));
+if (prompt.includes("read-only implementation planner")) setTimeout(() => submit(${JSON.stringify({ tasks: graph().tasks })}), 20);
 else if (prompt.includes("implementation worker")) emit("done");
 else if (prompt.includes("fresh read-only final auditor")) emit("No findings.");
 else process.exit(2);
@@ -162,7 +182,7 @@ else process.exit(2);
 			const component = factory(
 				{ terminal: { rows: 40 }, requestRender() {} },
 				{ fg: (_color, text) => text, bold: (text) => text },
-				{},
+				{ matches: (data) => data === "\x1b" },
 				() => {},
 			);
 			component.dispose();
@@ -349,7 +369,7 @@ test("confirmed dashboard cancellation pauses the active worker", async (t) => {
 		custom: (factory) => new Promise((resolve) => {
 			const tui = { terminal: { rows: 40 }, requestRender() {} };
 			const theme = { fg: (_color, text) => text, bold: (text) => text };
-			dashboard = factory(tui, theme, {}, (result) => {
+			dashboard = factory(tui, theme, { matches: (data) => data === "\x1b" }, (result) => {
 				dashboard?.dispose();
 				resolve(result);
 			});
@@ -389,7 +409,7 @@ test("cancellation restores protected files changed by verification", async (t) 
 		custom: (factory) => new Promise((resolve) => {
 			const tui = { terminal: { rows: 40 }, requestRender() {} };
 			const theme = { fg: (_color, text) => text, bold: (text) => text };
-			dashboard = factory(tui, theme, {}, (result) => {
+			dashboard = factory(tui, theme, { matches: (data) => data === "\x1b" }, (result) => {
 				dashboard?.dispose();
 				resolve(result);
 			});
@@ -420,8 +440,9 @@ import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 const prompt = process.argv.at(-1) ?? "";
 const emit = (text) => console.log(JSON.stringify({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text }], stopReason: "end" } }));
+const submit = (details) => console.log(JSON.stringify({ type: "tool_execution_end", toolCallId: "submit", toolName: "submit_task_graph", result: { content: [], details }, isError: false }));
 if (prompt.includes("read-only implementation planner")) {
-  emit(JSON.stringify(${JSON.stringify(graph([{ ...task("T001"), expectedFiles: ["fixed.txt"], verification: "test -f fixed.txt" }]))}));
+  submit(${JSON.stringify({ tasks: graph([{ ...task("T001"), expectedFiles: ["fixed.txt"], verification: "test -f fixed.txt" }]).tasks })});
 } else if (prompt.includes("implementation worker")) {
   const countPath = join(process.cwd(), "worker-count.txt");
   const count = existsSync(countPath) ? Number(readFileSync(countPath, "utf8")) + 1 : 1;
@@ -479,11 +500,12 @@ import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 const prompt = process.argv.at(-1) ?? "";
 const emit = (text) => console.log(JSON.stringify({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text }], stopReason: "end" } }));
+const submit = (details) => console.log(JSON.stringify({ type: "tool_execution_end", toolCallId: "submit", toolName: "submit_task_graph", result: { content: [], details }, isError: false }));
 if (prompt.includes("read-only implementation planner")) {
-  emit(JSON.stringify(${JSON.stringify(graph([
+  submit(${JSON.stringify({ tasks: graph([
 		{ ...task("T001"), expectedFiles: ["first.txt"], verification: "test -f first.txt" },
 		{ ...task("T002", ["T001"]), expectedFiles: ["second.txt"], verification: "test -f second.txt" },
-	]))}));
+	]).tasks })});
 } else if (prompt.includes("implementation worker")) {
   const name = prompt.includes("Task: T001") ? "first.txt" : "second.txt";
   writeFileSync(join(process.cwd(), name), "done\\n");

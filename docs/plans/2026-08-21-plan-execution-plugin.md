@@ -65,7 +65,7 @@ Use `node:child_process.spawn` to run Pi directly because it provides:
 
 - A fresh context for every task.
 - Explicit model, tools, working directory, environment, and cancellation control.
-- Structured JSON event output for progress and failure detection.
+- Structured JSON event output for progress, final-tool capture, and failure detection.
 - A live child handle for `/plan-stop` and `session_shutdown`.
 - No dependency on another extension or bridge package.
 
@@ -80,7 +80,7 @@ The planning process uses the session's active model and receives:
 - The current task graph when revising.
 - The user's feedback when revising.
 
-It returns JSON only. The plugin validates the result before showing it.
+It submits the completed task list through a dedicated terminating `submit_task_graph` tool. The tool schema excludes runtime state and encodes required task fields. The controller captures the successful tool result as it streams, adds initial runtime state, and validates the DAG before showing it. Planner prose is never parsed as executable state.
 
 The review shows each task's:
 
@@ -283,7 +283,7 @@ Test observable behavior:
 8. Terminate ordinary background process-group descendants before integrity checks.
 9. Preserve completed state across reload/resume.
 10. Write a successful audit and keep a completed run successful when the optional audit process fails.
-11. Parse streamed JSON across chunk boundaries and convert known tool events into bounded activity text.
+11. Parse streamed JSON across chunk boundaries, retain final results when buffered output truncates, and convert known tool events into bounded activity text.
 12. Require two `Esc` presses within two seconds before cancellation.
 13. Keep controller results unchanged when dashboard rendering fails.
 14. Preserve the existing durable-message flow outside TUI mode.
@@ -319,7 +319,7 @@ Exclude:
 
 1. Add task graph types, parsing, validation, persistence, and unit tests.
 2. Add the Pi subprocess runner and protected-file checks.
-3. Add `/execute-plan` planning, review, feedback, and approval.
+3. Add `/execute-plan` planning with a terminating structured-output tool, review, feedback, and approval.
 4. Add the sequential controller, verification, repair, status, stop, and resume.
 5. Add the final read-only audit and README documentation.
 6. Stream subprocess progress into a focused TUI dashboard with confirmed cancellation.
