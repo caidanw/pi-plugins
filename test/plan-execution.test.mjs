@@ -1,10 +1,10 @@
 import assert from "node:assert/strict";
-import { chmod, link, mkdir, mkdtemp, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
+import { chmod, link, mkdir, mkdtemp, readFile, rename, rm, stat, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { visibleWidth } from "@earendil-works/pi-tui";
-import planExecutionExtension, { plannerPrompt } from "../extensions/plan-execution.ts";
+import planExecutionExtension, { discoverResumablePlans, plannerPrompt } from "../extensions/plan-execution.ts";
 import planWorkerGuard from "../extensions/plan-execution/worker-guard.ts";
 import plannerSubmit from "../extensions/plan-execution/planner-submit.ts";
 import {
@@ -272,6 +272,78 @@ console.log(JSON.stringify({ type: "tool_execution_end", toolCallId: "submit", t
 	assert.equal(await readFile(countPath, "utf8"), "2");
 });
 
+test("discovers unfinished plans recursively and skips completed or ignored graphs", async (t) => {
+	const directory = await temporaryDirectory(t);
+	const docs = join(directory, "docs");
+	await mkdir(join(directory, "node_modules", "package"), { recursive: true });
+	await mkdir(docs, { recursive: true });
+	await writeFile(join(docs, "draft.md"), "# Draft\n");
+	const draft = graph();
+	draft.sourcePlan = "docs/draft.md";
+	draft.status = "draft";
+	await saveTaskGraph(join(docs, "draft.tasks.json"), draft);
+
+	const missing = graph();
+	missing.sourcePlan = "docs/missing.md";
+	missing.status = "paused";
+	await saveTaskGraph(join(docs, "missing.tasks.json"), missing);
+	const completed = graph();
+	completed.sourcePlan = "docs/completed.md";
+	completed.status = "completed";
+	await saveTaskGraph(join(docs, "completed.tasks.json"), completed);
+	await writeFile(join(docs, "invalid.tasks.json"), "not json\n");
+	await saveTaskGraph(join(directory, "node_modules", "package", "ignored.tasks.json"), draft);
+	await utimes(join(docs, "draft.tasks.json"), new Date(1_000), new Date(1_000));
+	await utimes(join(docs, "missing.tasks.json"), new Date(2_000), new Date(2_000));
+
+	const plans = await discoverResumablePlans(directory);
+	assert.deepEqual(plans.map(({ tasksPath }) => tasksPath).sort(), [
+		join(docs, "draft.tasks.json"),
+		join(docs, "invalid.tasks.json"),
+		join(docs, "missing.tasks.json"),
+	].sort());
+	assert.match(plans.find(({ tasksPath }) => tasksPath.endsWith("draft.tasks.json")).label, /draft\s+0\/1\s+docs\/draft\.md/);
+	assert.match(plans.find(({ tasksPath }) => tasksPath.endsWith("missing.tasks.json")).label, /unavailable.*source plan missing/);
+	assert.ok(plans.find(({ tasksPath }) => tasksPath.endsWith("invalid.tasks.json")).error);
+	assert.ok(plans.findIndex(({ tasksPath }) => tasksPath.endsWith("missing.tasks.json")) < plans.findIndex(({ tasksPath }) => tasksPath.endsWith("draft.tasks.json")));
+});
+
+test("plan-resume delegates a selected draft to the existing review flow", async (t) => {
+	const directory = await temporaryDirectory(t);
+	await writeFile(join(directory, "plan.md"), "# Plan\n");
+	const draft = graph();
+	draft.status = "draft";
+	await saveTaskGraph(join(directory, "plan.tasks.json"), draft);
+	const selections = [];
+	const ui = {
+		select: async (title, choices) => {
+			selections.push(title);
+			return title === "Resume plan" ? choices[0] : "Review draft";
+		},
+		custom: (factory) => new Promise((resolve) => {
+			let component;
+			const done = (value) => {
+				component?.dispose?.();
+				resolve(value);
+			};
+			component = factory(
+				{ terminal: { rows: 40 }, requestRender() {} },
+				{ fg: (_color, text) => text, bold: (text) => text },
+				{ matches: (data, action) => action === "tui.select.cancel" && data === "escape" },
+				done,
+			);
+			if (component instanceof TaskReview) {
+				component.handleInput("escape");
+				component.handleInput("escape");
+			}
+		}),
+	};
+	const { commands, ctx } = extensionHarness(directory, "", { mode: "tui", ui });
+	await commands.get("plan-resume").handler("", ctx);
+	assert.deepEqual(selections, ["Resume plan", "Unfinished task graph found"]);
+	assert.equal((await loadTaskGraph(join(directory, "plan.tasks.json"))).status, "draft");
+});
+
 test("dirty warning hides controller files while the audit baseline keeps every file", async (t) => {
 	const directory = await temporaryDirectory(t);
 	const docs = join(directory, "docs");
@@ -390,6 +462,8 @@ test("plan commands leave durable visible feedback", async (t) => {
 
 	await commands.get("plan-status").handler("", ctx);
 	assert.match(messages.at(-1).content, /No active plan/);
+	await commands.get("plan-resume").handler("", ctx);
+	assert.match(messages.at(-1).content, /No unfinished plans/);
 });
 
 test("rejects malformed and cyclic task graphs", () => {

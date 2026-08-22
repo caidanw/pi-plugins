@@ -1,4 +1,4 @@
-import { access, readFile, realpath, writeFile } from "node:fs/promises";
+import { access, readFile, readdir, realpath, stat, writeFile } from "node:fs/promises";
 import { isAbsolute, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
@@ -27,6 +27,15 @@ const WORKER_GUARD = fileURLToPath(new URL("./plan-execution/worker-guard.ts", i
 const PLANNER_SUBMIT = fileURLToPath(new URL("./plan-execution/planner-submit.ts", import.meta.url));
 const SUBMIT_TASK_GRAPH = "submit_task_graph";
 const STATUS_KEY = "plan-execution";
+const PLAN_SCAN_IGNORED_DIRECTORIES = new Set([".git", "node_modules", ".build", "build", "dist", "coverage"]);
+
+export type ResumablePlan = {
+	label: string;
+	tasksPath: string;
+	sourcePath?: string;
+	error?: string;
+	modifiedAt: number;
+};
 
 type ActiveRun = {
 	paths: ReturnType<typeof planPaths>;
@@ -39,6 +48,53 @@ type ActiveRun = {
 	done: Promise<void>;
 	dashboard?: PlanDashboard;
 };
+
+export async function discoverResumablePlans(cwd: string): Promise<ResumablePlan[]> {
+	const directories = [cwd];
+	const taskFiles: string[] = [];
+	while (directories.length) {
+		const directory = directories.pop()!;
+		const entries = await readdir(directory, { withFileTypes: true }).catch(() => []);
+		for (const entry of entries) {
+			const path = resolve(directory, entry.name);
+			if (entry.isDirectory() && !PLAN_SCAN_IGNORED_DIRECTORIES.has(entry.name)) directories.push(path);
+			else if (entry.isFile() && entry.name.endsWith(".tasks.json")) taskFiles.push(path);
+		}
+	}
+
+	const plans = await Promise.all(taskFiles.map(async (tasksPath): Promise<ResumablePlan | undefined> => {
+		const modifiedAt = await stat(tasksPath).then((value) => value.mtimeMs).catch(() => 0);
+		try {
+			const graph = normalizeForResume(await loadTaskGraph(tasksPath));
+			if (graph.status === "completed") return undefined;
+			const sourcePath = await realpath(resolve(cwd, graph.sourcePlan)).catch(() => undefined);
+			const sourceLabel = relative(cwd, resolve(cwd, graph.sourcePlan)) || graph.sourcePlan;
+			if (!sourcePath) return {
+				label: `unavailable  ${sourceLabel} — source plan missing`,
+				tasksPath,
+				error: "Source plan is missing",
+				modifiedAt,
+			};
+			const passed = graph.tasks.filter((task) => task.status === "passed").length;
+			const current = graph.tasks.find((task) => task.status === "running") ?? nextReadyTask(graph);
+			return {
+				label: `${graph.status.padEnd(8)}  ${passed}/${graph.tasks.length}  ${sourceLabel}${current ? ` — ${current.id}` : ""}`,
+				tasksPath,
+				sourcePath,
+				modifiedAt,
+			};
+		} catch (error: unknown) {
+			const message = (error instanceof Error ? error.message : String(error)).replace(/\s+/g, " ");
+			return {
+				label: `unavailable  ${relative(cwd, tasksPath)} — ${message}`,
+				tasksPath,
+				error: message,
+				modifiedAt,
+			};
+		}
+	}));
+	return plans.filter((plan): plan is ResumablePlan => plan !== undefined).sort((a, b) => b.modifiedAt - a.modifiedAt);
+}
 
 function modelName(ctx: ExtensionCommandContext): string {
 	if (!ctx.model || !ctx.modelRegistry.hasConfiguredAuth(ctx.model)) throw new Error("No authenticated active model");
@@ -534,9 +590,7 @@ export default function planExecutionExtension(pi: ExtensionAPI) {
 		}
 	}
 
-	pi.registerCommand("execute-plan", {
-		description: "Plan, approve, execute, verify, and audit a Markdown plan",
-		handler: async (args, ctx) => {
+	async function executePlan(args: string, ctx: ExtensionCommandContext): Promise<void> {
 			await ctx.waitForIdle();
 			if (!ctx.hasUI) throw new Error("/execute-plan requires an interactive UI");
 			if (active || planningAbort) {
@@ -613,6 +667,34 @@ export default function planExecutionExtension(pi: ExtensionAPI) {
 				planningAbort = undefined;
 				if (!active) ctx.ui.setStatus(STATUS_KEY, undefined);
 			}
+	}
+
+	pi.registerCommand("execute-plan", {
+		description: "Plan, approve, execute, verify, and audit a Markdown plan",
+		handler: executePlan,
+	});
+
+	pi.registerCommand("plan-resume", {
+		description: "Find and resume an unfinished plan",
+		handler: async (_args, ctx) => {
+			if (!ctx.hasUI) throw new Error("/plan-resume requires an interactive UI");
+			if (active || planningAbort) {
+				report(ctx, "A plan is already active", "warning");
+				return;
+			}
+			const plans = await discoverResumablePlans(ctx.cwd);
+			if (!plans.length) {
+				report(ctx, "No unfinished plans found in this repository", "info");
+				return;
+			}
+			const selected = await ctx.ui.select("Resume plan", plans.map((plan) => plan.label));
+			if (!selected) return;
+			const plan = plans.find((candidate) => candidate.label === selected);
+			if (!plan?.sourcePath) {
+				report(ctx, plan?.error ?? "Plan is unavailable", "error");
+				return;
+			}
+			await executePlan(relative(ctx.cwd, plan.sourcePath) || plan.sourcePath, ctx);
 		},
 	});
 

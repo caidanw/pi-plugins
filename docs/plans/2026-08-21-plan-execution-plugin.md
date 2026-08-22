@@ -24,12 +24,15 @@ The plugin then:
 6. Runs each task's verification command.
 7. Runs a fresh read-only audit after every task passes.
 
-Keep two auxiliary commands:
+Keep three auxiliary commands:
 
 ```text
+/plan-resume
 /plan-status
 /plan-stop
 ```
+
+`/plan-resume` recursively discovers unfinished task graphs in the current repository and delegates the selected graph to the same review, resume, or regeneration flow as `/execute-plan`.
 
 Calling `/execute-plan` again for an unfinished plan offers to resume or regenerate it. Regeneration discards prior task state and evidence only after confirmation, then requires a new approval before any verification command can run.
 

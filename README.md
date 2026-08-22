@@ -36,7 +36,7 @@ Turn a Markdown implementation plan into an approved task DAG, then run each tas
 
 The planner submits tasks through a validated structured-output tool. Review every generated task and verification command before choosing **Approve and run**. In the TUI, a focused dashboard shows planning, tool activity, task progress, verification output, repairs, and the final audit. Press `Esc` twice within two seconds to pause or stop and exit.
 
-Execution is sequential. The controller verifies each task, allows one repair attempt, preserves resumable state in a sibling `.tasks.json` file, and writes an advisory final audit to `.audit.md`. Use `/plan-status` and `/plan-stop` from non-TUI clients. Do not edit the checkout from another process while workers are active.
+Execution is sequential. The controller verifies each task, allows one repair attempt, preserves resumable state in a sibling `.tasks.json` file, and writes an advisory final audit to `.audit.md`. Use `/plan-resume` to find unfinished plans in the current repository; `/plan-status` and `/plan-stop` remain available from non-TUI clients. Do not edit the checkout from another process while workers are active.
 
 ## Security
 
