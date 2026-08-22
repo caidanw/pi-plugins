@@ -268,17 +268,22 @@ export default function planExecutionExtension(pi: ExtensionAPI) {
 		ctx: ExtensionCommandContext,
 		sourcePath: string,
 		storedSourcePath: string,
+		draftPath: string,
+		baseline: TaskGraph["baseline"],
 		current?: TaskGraph,
+		reviewCurrent = false,
 	): Promise<TaskGraph | undefined> {
 		let candidate = current;
 		let feedback: string | undefined;
 		let feedbackTaskId: string | undefined;
 		let selectedTaskId: string | undefined;
-		let needsPlanning = true;
+		let needsPlanning = !reviewCurrent;
 		while (!planningAbort?.signal.aborted) {
 			if (needsPlanning) {
 				try {
 					candidate = await runPlanner(ctx, sourcePath, storedSourcePath, candidate, feedback, feedbackTaskId);
+					candidate.baseline = baseline;
+					await saveTaskGraph(draftPath, candidate);
 					feedback = undefined;
 					feedbackTaskId = undefined;
 				} catch (error: unknown) {
@@ -294,7 +299,10 @@ export default function planExecutionExtension(pi: ExtensionAPI) {
 			needsPlanning = false;
 
 			const action = await reviewTaskGraph(ctx, storedSourcePath, candidate, selectedTaskId);
-			if (action.type === "approve") return candidate;
+			if (action.type === "approve") {
+				candidate.status = "approved";
+				return candidate;
+			}
 			if (action.type === "cancel") return undefined;
 			feedbackTaskId = action.type === "task-feedback" ? action.taskId : undefined;
 			selectedTaskId = action.type === "general-feedback" ? action.selectedTaskId : action.taskId;
@@ -461,6 +469,7 @@ export default function planExecutionExtension(pi: ExtensionAPI) {
 	}
 
 	async function startExecution(ctx: ExtensionCommandContext, paths: ReturnType<typeof planPaths>, graph: TaskGraph): Promise<void> {
+		if (graph.status === "draft") throw new Error("Cannot execute an unapproved task graph");
 		graph.status = "running";
 		await saveTaskGraph(paths.tasks, graph);
 		const run: ActiveRun = {
@@ -532,6 +541,7 @@ export default function planExecutionExtension(pi: ExtensionAPI) {
 			const paths = planPaths(sourcePath);
 			const storedSourcePath = relative(ctx.cwd, sourcePath) || sourcePath;
 			let existing: TaskGraph | undefined;
+			let reviewDraft = false;
 			if (await fileExists(paths.tasks)) {
 				try {
 					existing = normalizeForResume(await loadTaskGraph(paths.tasks));
@@ -544,27 +554,30 @@ export default function planExecutionExtension(pi: ExtensionAPI) {
 					report(ctx, `Plan already completed: ${relative(ctx.cwd, paths.tasks)}`, "info");
 					return;
 				}
-				const choices = existing.status === "failed" ? ["Regenerate", "Cancel"] : ["Resume", "Regenerate", "Cancel"];
+				let choices = ["Resume", "Regenerate", "Cancel"];
+				if (existing.status === "draft") choices = ["Review draft", "Regenerate", "Cancel"];
+				else if (existing.status === "failed") choices = ["Regenerate", "Cancel"];
 				const action = await ctx.ui.select("Unfinished task graph found", choices);
-				if (action === "Resume") {
+				if (action === "Review draft") reviewDraft = true;
+				else if (action === "Resume") {
 					report(ctx, `Resuming ${storedSourcePath}`, "info");
 					await saveTaskGraph(paths.tasks, existing);
 					await startExecution(ctx, paths, existing);
 					return;
+				} else {
+					if (action !== "Regenerate") return;
+					if (!await ctx.ui.confirm("Regenerate task graph?", "This discards all task state and evidence.")) return;
 				}
-				if (action !== "Regenerate") return;
-				if (!await ctx.ui.confirm("Regenerate task graph?", "This discards all task state and evidence.")) return;
 			}
 
+			const baseline = existing?.baseline ?? await gitState(ctx.cwd);
 			planningAbort = new AbortController();
-			ctx.ui.setStatus(STATUS_KEY, "planning tasks");
-			report(ctx, `Planning ${storedSourcePath}`, "info");
+			ctx.ui.setStatus(STATUS_KEY, reviewDraft ? "reviewing task draft" : "planning tasks");
+			report(ctx, reviewDraft ? `Reviewing saved draft for ${storedSourcePath}` : `Planning ${storedSourcePath}`, "info");
 			try {
-				const graph = await planAndApprove(ctx, sourcePath, storedSourcePath, existing);
+				const graph = await planAndApprove(ctx, sourcePath, storedSourcePath, paths.tasks, baseline, existing, reviewDraft);
 				if (!graph) return;
-				const baseline = await gitState(ctx.cwd);
-				if (baseline.gitStatus && !await ctx.ui.confirm("Dirty worktree", `Existing changes will be recorded for the auditor:\n\n${baseline.gitStatus}\n\nContinue?`)) return;
-				graph.baseline = baseline;
+				if (graph.baseline.gitStatus && !await ctx.ui.confirm("Dirty worktree", `Existing changes will be recorded for the auditor:\n\n${graph.baseline.gitStatus}\n\nContinue?`)) return;
 				await saveTaskGraph(paths.tasks, graph);
 				report(ctx, "Plan approved. Keep this checkout read-only while workers run.", "warning");
 				planningAbort = undefined;

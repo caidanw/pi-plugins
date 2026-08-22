@@ -4,11 +4,11 @@ import { chmod, lstat, mkdir, readFile, realpath, rename, rm, writeFile } from "
 import { basename, dirname, extname, join, resolve } from "node:path";
 import { StringDecoder } from "node:string_decoder";
 
-const RUN_STATUSES = new Set(["approved", "running", "paused", "completed", "failed"]);
+const RUN_STATUSES = new Set(["draft", "approved", "running", "paused", "completed", "failed"]);
 const TASK_STATUSES = new Set(["pending", "running", "passed", "failed"]);
 const OUTPUT_LIMIT = 50 * 1024;
 
-export type RunStatus = "approved" | "running" | "paused" | "completed" | "failed";
+export type RunStatus = "draft" | "approved" | "running" | "paused" | "completed" | "failed";
 export type TaskStatus = "pending" | "running" | "passed" | "failed";
 export type EvidenceKind = "worker" | "integrity" | "verification";
 
@@ -183,7 +183,7 @@ export function parsePlannerTaskGraph(value: unknown, sourcePlan: string): TaskG
 	return parseTaskGraph({
 		version: 1,
 		sourcePlan,
-		status: "approved",
+		status: "draft",
 		baseline: { gitStatus: "", gitDiff: "" },
 		tasks: input.tasks.map((task, index) => ({
 			...object(task, `planner submission.tasks[${index}]`),

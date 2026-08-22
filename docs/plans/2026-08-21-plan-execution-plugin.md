@@ -80,7 +80,7 @@ The planning process uses the session's active model and receives:
 - The current task graph when revising.
 - The user's feedback when revising.
 
-It submits the completed task list through a dedicated terminating `submit_task_graph` tool. The tool schema excludes runtime state and encodes required task fields. The controller captures the successful tool result as it streams, adds initial runtime state, and validates the DAG before showing it. Planner prose is never parsed as executable state.
+It submits the completed task list through a dedicated terminating `submit_task_graph` tool. The tool schema excludes runtime state and encodes required task fields. The controller captures the successful tool result as it streams, adds initial runtime state, validates the DAG, and atomically saves it as a draft before showing it. Every valid feedback revision replaces the saved draft; planner failures and review cancellation preserve the last valid version. Planner prose is never parsed as executable state.
 
 The review shows each task's:
 
@@ -157,12 +157,12 @@ Required validation:
 - Every status is recognized.
 - At least one task exists.
 
-Allow these run statuses: `approved`, `running`, `paused`, `completed`, and `failed`.
+Allow these run statuses: `draft`, `approved`, `running`, `paused`, `completed`, and `failed`.
 
 ```text
-approved → running → completed
-              ↘ failed
-              ↘ paused → running
+draft → approved → running → completed
+                         ↘ failed
+                         ↘ paused → running
 ```
 
 Use these task states:

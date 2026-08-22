@@ -13,6 +13,7 @@ import {
 	loadTaskGraph,
 	nextReadyTask,
 	normalizeForResume,
+	parsePlannerTaskGraph,
 	parseTaskGraph,
 	restoreChangedFiles,
 	runPi,
@@ -120,6 +121,7 @@ test("planner submits one terminating structured task graph", async () => {
 	const result = await tool.execute("call", { tasks });
 	assert.equal(result.terminate, true);
 	assert.deepEqual(result.details, { tasks });
+	assert.equal(parsePlannerTaskGraph(result.details, "plan.md").status, "draft");
 });
 
 test("planner feedback can target one task or the whole graph", () => {
@@ -196,6 +198,78 @@ test("structured task review navigates and returns scoped actions", () => {
 	cancelReview.handleInput("escape");
 	assert.deepEqual(cancelled, { type: "cancel" });
 	cancelReview.dispose();
+});
+
+test("persists planner drafts before review and reopens them without replanning", async (t) => {
+	const directory = await temporaryDirectory(t);
+	const planPath = join(directory, "plan.md");
+	const tasksPath = join(directory, "plan.tasks.json");
+	const countPath = join(directory, "planner-count.txt");
+	const fakePi = join(directory, "fake-pi.mjs");
+	await writeFile(planPath, "# Plan\n");
+	await writeFile(fakePi, `#!/usr/bin/env node
+import { readFileSync, writeFileSync } from "node:fs";
+const prompt = process.argv.at(-1) ?? "";
+const countPath = ${JSON.stringify(countPath)};
+let count = 0;
+try { count = Number(readFileSync(countPath, "utf8")); } catch {}
+writeFileSync(countPath, String(count + 1));
+const title = prompt.includes("<user-feedback") ? "Revised draft" : "Initial draft";
+console.log(JSON.stringify({ type: "tool_execution_end", toolCallId: "submit", toolName: "submit_task_graph", result: { content: [], details: { tasks: [{ id: "T001", title, instructions: "Implement it", acceptance: ["It works"], dependsOn: [], expectedFiles: ["test.txt"], verification: "true" }] } }, isError: false }));
+`);
+	await chmod(fakePi, 0o755);
+	useFakePi(t, fakePi);
+
+	const snapshots = [];
+	const reviewUi = (actions) => ({
+		editor: async () => "Revise it",
+		custom: (factory) => new Promise((resolve, reject) => {
+			let component;
+			const done = (value) => {
+				component?.dispose?.();
+				resolve(value);
+			};
+			component = factory(
+				{ terminal: { rows: 40 }, requestRender() {} },
+				{ fg: (_color, text) => text, bold: (text) => text },
+				{ matches: (data, action) => action === "tui.select.cancel" && data === "escape" },
+				done,
+			);
+			if (!(component instanceof TaskReview)) return;
+			loadTaskGraph(tasksPath).then((draft) => {
+				snapshots.push({ status: draft.status, title: draft.tasks[0].title });
+				const action = actions.shift();
+				if (action === "feedback") component.handleInput("f");
+				else {
+					component.handleInput("escape");
+					component.handleInput("escape");
+				}
+			}).catch(reject);
+		}),
+	});
+
+	const first = extensionHarness(directory, "", { mode: "tui", ui: reviewUi(["feedback", "cancel"]) });
+	await first.commands.get("execute-plan").handler("plan.md", first.ctx);
+	assert.deepEqual(snapshots, [
+		{ status: "draft", title: "Initial draft" },
+		{ status: "draft", title: "Revised draft" },
+	]);
+	assert.equal(await readFile(countPath, "utf8"), "2");
+
+	let offeredChoices;
+	const second = extensionHarness(directory, "Review draft", {
+		mode: "tui",
+		ui: {
+			...reviewUi(["cancel"]),
+			select: async (_title, choices) => {
+				offeredChoices = choices;
+				return "Review draft";
+			},
+		},
+	});
+	await second.commands.get("execute-plan").handler("plan.md", second.ctx);
+	assert.deepEqual(offeredChoices, ["Review draft", "Regenerate", "Cancel"]);
+	assert.equal(await readFile(countPath, "utf8"), "2");
 });
 
 test("streams split Pi JSON events without letting observers change results", async (t) => {
