@@ -20,7 +20,7 @@ Keep the selected task visible as the user navigates. Bound the task list to the
 
 The footer always shows these controls. The first cancellation keypress changes the footer to the confirmation warning.
 
-Task-specific feedback identifies the selected task in both the editor title and planner prompt. The planner should preserve unrelated tasks and stable IDs, while allowing changes required by dependencies. General feedback retains the existing whole-graph behavior. Either feedback path regenerates and reopens the review screen.
+Task-specific feedback identifies the selected task in both the editor title and planner prompt. The planner should preserve unrelated tasks and stable IDs, while allowing changes required by dependencies. General feedback retains the existing whole-graph behavior. Either feedback path regenerates and reopens the review screen on the previously selected task when it still exists.
 
 ## Modes
 

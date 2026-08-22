@@ -19,7 +19,7 @@ import {
 	type TaskEvidence,
 	type TaskGraph,
 } from "./plan-execution/core.ts";
-import { PlanDashboard, type DashboardPhase } from "./plan-execution/ui.ts";
+import { PlanDashboard, TaskReview, type DashboardPhase, type TaskReviewAction } from "./plan-execution/ui.ts";
 
 const READ_ONLY_TOOLS = ["read", "grep", "find", "ls"];
 const WORKER_TOOLS = ["read", "bash", "edit", "write", "grep", "find", "ls"];
@@ -55,7 +55,7 @@ function reviewText(graph: TaskGraph): string {
 	].join("\n")).join("\n\n");
 }
 
-function plannerPrompt(sourcePlan: string, plan: string, current?: TaskGraph, feedback?: string): string {
+export function plannerPrompt(sourcePlan: string, plan: string, current?: TaskGraph, feedback?: string, feedbackTaskId?: string): string {
 	return `You are a read-only implementation planner. Convert the source Markdown plan into the smallest complete sequentially-executable task DAG. Inspect the repository only as needed. Do not modify files.
 
 Submit the completed DAG with the submit_task_graph tool exactly once as your final action. Do not return the graph as prose or JSON text.
@@ -71,7 +71,9 @@ Rules:
 ${plan}
 </source-plan>
 ${current ? `\n<current-task-graph>\n${JSON.stringify(current, null, 2)}\n</current-task-graph>` : ""}
-${feedback ? `\n<user-feedback>\n${feedback}\n</user-feedback>` : ""}`;
+${feedback ? feedbackTaskId
+	? `\n<user-feedback task=${JSON.stringify(feedbackTaskId)}>\nRevise ${feedbackTaskId} according to this feedback. Preserve unrelated tasks and stable IDs unless a dependency requires a change.\n${feedback}\n</user-feedback>`
+	: `\n<user-feedback scope="graph">\n${feedback}\n</user-feedback>` : ""}`;
 }
 
 function workerPrompt(sourcePlan: string, graph: TaskGraph, task: PlanTask): string {
@@ -213,8 +215,9 @@ export default function planExecutionExtension(pi: ExtensionAPI) {
 		storedSourcePath: string,
 		current?: TaskGraph,
 		feedback?: string,
+		feedbackTaskId?: string,
 	): Promise<TaskGraph> {
-		const prompt = plannerPrompt(storedSourcePath, await readFile(sourcePath, "utf8"), current, feedback);
+		const prompt = plannerPrompt(storedSourcePath, await readFile(sourcePath, "utf8"), current, feedback, feedbackTaskId);
 		let submission: unknown;
 		let submissionCount = 0;
 		const plan = (dashboard?: PlanDashboard) => runPi({
@@ -246,6 +249,21 @@ export default function planExecutionExtension(pi: ExtensionAPI) {
 		return parsePlannerTaskGraph(submission, storedSourcePath);
 	}
 
+	async function reviewTaskGraph(ctx: ExtensionCommandContext, sourcePlan: string, graph: TaskGraph, selectedTaskId?: string): Promise<TaskReviewAction> {
+		if (ctx.mode === "tui") {
+			try {
+				return await ctx.ui.custom<TaskReviewAction>((tui, theme, keybindings, done) =>
+					new TaskReview(tui, theme, graph, sourcePlan, keybindings, done, selectedTaskId));
+			} catch (error: unknown) {
+				ctx.ui.notify(`Structured task review unavailable: ${error instanceof Error ? error.message : String(error)}`, "warning");
+			}
+		}
+		const action = await selectWithConfirmedEscape(ctx, `Review generated task graph\n\n${reviewText(graph)}`, ["Approve and run", "Add feedback", "Cancel"]);
+		if (action === "Approve and run") return { type: "approve" };
+		if (action === "Add feedback") return { type: "general-feedback", selectedTaskId: graph.tasks[0]!.id };
+		return { type: "cancel" };
+	}
+
 	async function planAndApprove(
 		ctx: ExtensionCommandContext,
 		sourcePath: string,
@@ -254,24 +272,39 @@ export default function planExecutionExtension(pi: ExtensionAPI) {
 	): Promise<TaskGraph | undefined> {
 		let candidate = current;
 		let feedback: string | undefined;
+		let feedbackTaskId: string | undefined;
+		let selectedTaskId: string | undefined;
+		let needsPlanning = true;
 		while (!planningAbort?.signal.aborted) {
-			try {
-				candidate = await runPlanner(ctx, sourcePath, storedSourcePath, candidate, feedback);
+			if (needsPlanning) {
+				try {
+					candidate = await runPlanner(ctx, sourcePath, storedSourcePath, candidate, feedback, feedbackTaskId);
+					feedback = undefined;
+					feedbackTaskId = undefined;
+				} catch (error: unknown) {
+					if (planningAbort?.signal.aborted) return undefined;
+					const message = error instanceof Error ? error.message : String(error);
+					const action = await selectWithConfirmedEscape(ctx, `Task graph error\n\n${message}`, ["Try again", "Add feedback", "Cancel"]);
+					if (!action || action === "Cancel") return undefined;
+					if (action === "Add feedback") feedback = await ctx.ui.editor("Planner feedback", "");
+					continue;
+				}
+			}
+			if (!candidate) return undefined;
+			needsPlanning = false;
+
+			const action = await reviewTaskGraph(ctx, storedSourcePath, candidate, selectedTaskId);
+			if (action.type === "approve") return candidate;
+			if (action.type === "cancel") return undefined;
+			feedbackTaskId = action.type === "task-feedback" ? action.taskId : undefined;
+			selectedTaskId = action.type === "general-feedback" ? action.selectedTaskId : action.taskId;
+			feedback = await ctx.ui.editor(feedbackTaskId ? `Feedback on ${feedbackTaskId}` : "General planner feedback", "");
+			if (!feedback?.trim()) {
 				feedback = undefined;
-			} catch (error: unknown) {
-				if (planningAbort?.signal.aborted) return undefined;
-				const message = error instanceof Error ? error.message : String(error);
-				const action = await selectWithConfirmedEscape(ctx, `Task graph error\n\n${message}`, ["Try again", "Add feedback", "Cancel"]);
-				if (!action || action === "Cancel") return undefined;
-				if (action === "Add feedback") feedback = await ctx.ui.editor("Planner feedback", "");
+				feedbackTaskId = undefined;
 				continue;
 			}
-
-			const action = await selectWithConfirmedEscape(ctx, `Review generated task graph\n\n${reviewText(candidate)}`, ["Approve and run", "Add feedback", "Cancel"]);
-			if (action === "Approve and run") return candidate;
-			if (!action || action === "Cancel") return undefined;
-			feedback = await ctx.ui.editor("Planner feedback", "");
-			if (feedback === undefined) feedback = "";
+			needsPlanning = true;
 		}
 		return undefined;
 	}

@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { visibleWidth } from "@earendil-works/pi-tui";
-import planExecutionExtension from "../extensions/plan-execution.ts";
+import planExecutionExtension, { plannerPrompt } from "../extensions/plan-execution.ts";
 import planWorkerGuard from "../extensions/plan-execution/worker-guard.ts";
 import plannerSubmit from "../extensions/plan-execution/planner-submit.ts";
 import {
@@ -19,7 +19,7 @@ import {
 	runVerification,
 	saveTaskGraph,
 } from "../extensions/plan-execution/core.ts";
-import { activityFromPiEvent, PlanDashboard } from "../extensions/plan-execution/ui.ts";
+import { activityFromPiEvent, PlanDashboard, TaskReview } from "../extensions/plan-execution/ui.ts";
 
 function graph(tasks = [task("T001")]) {
 	return {
@@ -122,6 +122,14 @@ test("planner submits one terminating structured task graph", async () => {
 	assert.deepEqual(result.details, { tasks });
 });
 
+test("planner feedback can target one task or the whole graph", () => {
+	const scoped = plannerPrompt("plan.md", "# Plan", graph(), "Split the criteria", "T001");
+	assert.match(scoped, /<user-feedback task="T001">/);
+	assert.match(scoped, /Preserve unrelated tasks and stable IDs/);
+	assert.match(scoped, /Split the criteria/);
+	assert.match(plannerPrompt("plan.md", "# Plan", graph(), "Reorder everything"), /<user-feedback scope="graph">/);
+});
+
 test("turns known Pi tool events into concise activity text", () => {
 	assert.equal(activityFromPiEvent({ type: "tool_execution_start", toolName: "read", args: { path: "src/app.ts" } }), "Reading src/app.ts");
 	assert.equal(activityFromPiEvent({ type: "tool_execution_start", toolName: "grep", args: { pattern: "parse", path: "test/" } }), "Searching test/ for parse");
@@ -146,6 +154,48 @@ test("dashboard bounds activity history and confirms cancellation", async () => 
 	dashboard.handleInput("kitty-escape");
 	assert.equal(cancellations, 1);
 	dashboard.dispose();
+});
+
+test("structured task review navigates and returns scoped actions", () => {
+	const value = graph([task("T001"), { ...task("T002", ["T001"]), title: "分析 ingestion 🚀", acceptance: ["Handles wide characters correctly"] }]);
+	const tui = { terminal: { rows: 40 }, requestRender() {} };
+	const theme = { fg: (_color, text) => text, bold: (text) => text };
+	const keybindings = { matches: (data, action) => data === ({ "tui.select.up": "up", "tui.select.down": "down", "tui.select.cancel": "escape" })[action] };
+	let result;
+	const review = new TaskReview(tui, theme, value, "plan.md", keybindings, (action) => { result = action; }, undefined, 10);
+
+	assert.match(review.render(80).join("\n"), /T001[\s\S]*T001 works/);
+	review.handleInput("down");
+	const rendered = review.render(24);
+	assert.match(rendered.join("\n"), /T002[\s\S]*Handles wide/);
+	assert.ok(rendered.every((line) => visibleWidth(line) <= 24));
+	review.handleInput("f");
+	assert.deepEqual(result, { type: "task-feedback", taskId: "T002" });
+	review.dispose();
+
+	const refocused = new TaskReview(tui, theme, value, "plan.md", keybindings, () => {}, "T002");
+	assert.match(refocused.render(80).join("\n"), /T002[\s\S]*Handles wide characters correctly/);
+	refocused.dispose();
+
+	let general;
+	const generalReview = new TaskReview(tui, theme, value, "plan.md", keybindings, (action) => { general = action; });
+	generalReview.handleInput("g");
+	assert.deepEqual(general, { type: "general-feedback", selectedTaskId: "T001" });
+	generalReview.dispose();
+
+	let approved;
+	const approvalReview = new TaskReview(tui, theme, value, "plan.md", keybindings, (action) => { approved = action; });
+	approvalReview.handleInput("a");
+	assert.deepEqual(approved, { type: "approve" });
+	approvalReview.dispose();
+
+	let cancelled;
+	const cancelReview = new TaskReview(tui, theme, value, "plan.md", keybindings, (action) => { cancelled = action; });
+	cancelReview.handleInput("escape");
+	assert.equal(cancelled, undefined);
+	cancelReview.handleInput("escape");
+	assert.deepEqual(cancelled, { type: "cancel" });
+	cancelReview.dispose();
 });
 
 test("streams split Pi JSON events without letting observers change results", async (t) => {

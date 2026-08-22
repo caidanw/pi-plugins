@@ -1,12 +1,22 @@
 import type { Theme } from "@earendil-works/pi-coding-agent";
-import { truncateToWidth } from "@earendil-works/pi-tui";
+import { matchesKey, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import type { PlanTask, TaskGraph } from "./core.ts";
 
 export type DashboardPhase = "planning" | "worker" | "verification" | "audit";
 
+export type TaskReviewAction =
+	| { type: "approve" }
+	| { type: "task-feedback"; taskId: string }
+	| { type: "general-feedback"; selectedTaskId: string }
+	| { type: "cancel" };
+
 type DashboardTui = {
 	terminal: { rows: number };
 	requestRender(): void;
+};
+
+type ReviewKeybindings = {
+	matches(data: string, keybinding: "tui.select.up" | "tui.select.down" | "tui.select.cancel"): boolean;
 };
 
 type ToolEvent = {
@@ -64,6 +74,138 @@ function phaseLabel(phase: DashboardPhase): string {
 		case "worker": return "Implementing task";
 		case "verification": return "Verifying task";
 		case "audit": return "Running final audit";
+	}
+}
+
+function wrapIndented(value: string, width: number, firstPrefix: string, continuationPrefix = "    "): string[] {
+	const available = Math.max(1, width - visibleWidth(firstPrefix));
+	return wrapTextWithAnsi(value, available).map((line, index) => `${index === 0 ? firstPrefix : continuationPrefix}${line}`);
+}
+
+export class TaskReview {
+	private selectedIndex = 0;
+	private cancelArmedUntil = 0;
+	private cancelTimer?: NodeJS.Timeout;
+	private finished = false;
+	private readonly tui: DashboardTui;
+	private readonly theme: Theme;
+	private readonly graph: TaskGraph;
+	private readonly sourcePlan: string;
+	private readonly keybindings: ReviewKeybindings;
+	private readonly done: (action: TaskReviewAction) => void;
+	private readonly cancelWindowMs: number;
+
+	constructor(
+		tui: DashboardTui,
+		theme: Theme,
+		graph: TaskGraph,
+		sourcePlan: string,
+		keybindings: ReviewKeybindings,
+		done: (action: TaskReviewAction) => void,
+		initialTaskId?: string,
+		cancelWindowMs = 2_000,
+	) {
+		this.tui = tui;
+		this.theme = theme;
+		this.graph = graph;
+		this.sourcePlan = sourcePlan;
+		this.keybindings = keybindings;
+		this.done = done;
+		this.cancelWindowMs = cancelWindowMs;
+		this.selectedIndex = Math.max(0, graph.tasks.findIndex((task) => task.id === initialTaskId));
+	}
+
+	render(width: number): string[] {
+		const contentWidth = Math.max(10, width - 2);
+		const task = this.graph.tasks[this.selectedIndex];
+		const lines: string[] = [
+			this.theme.bold(`Review Task Graph — ${this.sourcePlan}`),
+			this.theme.fg("dim", "─".repeat(contentWidth)),
+			`${this.theme.bold("Tasks")}  ${this.theme.fg("dim", `${this.graph.tasks.length} total`)}`,
+		];
+
+		const limit = Math.max(3, Math.min(8, Math.floor(this.tui.terminal.rows / 4)));
+		const start = Math.max(0, Math.min(this.selectedIndex - 2, this.graph.tasks.length - limit));
+		const shown = this.graph.tasks.slice(start, start + limit);
+		if (start > 0) lines.push(this.theme.fg("dim", `  … ${start} earlier tasks`));
+		for (const [offset, candidate] of shown.entries()) {
+			const selected = start + offset === this.selectedIndex;
+			const marker = this.theme.fg(selected ? "accent" : "dim", selected ? "▶" : "○");
+			const id = this.theme.fg("accent", candidate.id);
+			const dependency = candidate.dependsOn.length ? `  ← ${candidate.dependsOn.join(", ")}` : "  root";
+			const label = `${marker} ${id}  ${candidate.title}${this.theme.fg("dim", dependency)}`;
+			lines.push(selected ? this.theme.bold(label) : label);
+		}
+		const hiddenAfter = this.graph.tasks.length - start - shown.length;
+		if (hiddenAfter > 0) lines.push(this.theme.fg("dim", `  … ${hiddenAfter} later tasks`));
+
+		if (task) {
+			lines.push("", this.theme.fg("dim", "─".repeat(contentWidth)));
+			lines.push(...wrapTextWithAnsi(`${this.theme.fg("accent", task.id)}  ${this.theme.bold(task.title)}`, contentWidth));
+			lines.push("", this.theme.bold("Dependencies"));
+			lines.push(`  ${task.dependsOn.length ? this.theme.fg("warning", task.dependsOn.join(", ")) : this.theme.fg("dim", "None")}`);
+			lines.push("", this.theme.bold("Acceptance"));
+			for (const criterion of task.acceptance) {
+				lines.push(...wrapIndented(criterion, contentWidth, `  ${this.theme.fg("success", "•")} `, "    "));
+			}
+			lines.push("", this.theme.bold("Expected files"));
+			if (task.expectedFiles.length) {
+				for (const path of task.expectedFiles) lines.push(...wrapIndented(this.theme.fg("dim", path), contentWidth, "  ", "  "));
+			} else {
+				lines.push(this.theme.fg("dim", "  Unspecified"));
+			}
+			lines.push("", this.theme.bold("Verification"));
+			lines.push(...wrapIndented(task.verification, contentWidth, `  ${this.theme.fg("warning", "$")} `, "    "));
+		}
+
+		lines.push("", this.theme.fg("dim", "─".repeat(contentWidth)));
+		lines.push(this.cancelArmedUntil >= Date.now()
+			? this.theme.fg("warning", "Press Esc again within 2 seconds to cancel")
+			: `${this.theme.fg("accent", "↑↓")} Select  ${this.theme.fg("accent", "A")} Approve  ${this.theme.fg("accent", "F")} Feedback on ${task?.id ?? "task"}  ${this.theme.fg("accent", "G")} General feedback  ${this.theme.fg("accent", "Esc")} Cancel`);
+		return lines.map((line) => truncateToWidth(line, width, "…"));
+	}
+
+	handleInput(data: string): void {
+		if (this.finished) return;
+		if (this.keybindings.matches(data, "tui.select.cancel")) {
+			const now = Date.now();
+			if (this.cancelArmedUntil >= now) {
+				this.finish({ type: "cancel" });
+				return;
+			}
+			this.cancelArmedUntil = now + this.cancelWindowMs;
+			if (this.cancelTimer) clearTimeout(this.cancelTimer);
+			this.cancelTimer = setTimeout(() => {
+				this.cancelArmedUntil = 0;
+				this.renderSoon();
+			}, this.cancelWindowMs);
+			this.renderSoon();
+			return;
+		}
+		if (this.keybindings.matches(data, "tui.select.up")) this.selectedIndex = Math.max(0, this.selectedIndex - 1);
+		else if (this.keybindings.matches(data, "tui.select.down")) this.selectedIndex = Math.min(this.graph.tasks.length - 1, this.selectedIndex + 1);
+		else if (matchesKey(data, "a")) this.finish({ type: "approve" });
+		else if (matchesKey(data, "f")) this.finish({ type: "task-feedback", taskId: this.graph.tasks[this.selectedIndex]!.id });
+		else if (matchesKey(data, "g")) this.finish({ type: "general-feedback", selectedTaskId: this.graph.tasks[this.selectedIndex]!.id });
+		this.renderSoon();
+	}
+
+	invalidate(): void {
+		this.renderSoon();
+	}
+
+	dispose(): void {
+		if (this.cancelTimer) clearTimeout(this.cancelTimer);
+	}
+
+	private finish(action: TaskReviewAction): void {
+		this.finished = true;
+		if (this.cancelTimer) clearTimeout(this.cancelTimer);
+		this.done(action);
+	}
+
+	private renderSoon(): void {
+		try { this.tui.requestRender(); } catch { /* Review state remains authoritative. */ }
 	}
 }
 
