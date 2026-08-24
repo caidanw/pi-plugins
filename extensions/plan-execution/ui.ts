@@ -2,7 +2,7 @@ import type { Theme } from "@earendil-works/pi-coding-agent";
 import { matchesKey, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import type { PlanTask, TaskGraph } from "./core.ts";
 
-export type DashboardPhase = "planning" | "worker" | "verification" | "audit";
+export type DashboardPhase = "planning" | "worker" | "verification" | "commit" | "audit";
 
 export type TaskReviewAction =
 	| { type: "approve" }
@@ -73,6 +73,7 @@ function phaseLabel(phase: DashboardPhase): string {
 		case "planning": return "Building task graph";
 		case "worker": return "Implementing task";
 		case "verification": return "Verifying task";
+		case "commit": return "Committing verified task";
 		case "audit": return "Running final audit";
 	}
 }
@@ -351,8 +352,8 @@ export class PlanDashboard {
 		const lines = [this.theme.bold(`Tasks — ${tasks.filter((task) => task.status === "passed").length}/${tasks.length} passed`)];
 		if (start > 0) lines.push(this.theme.fg("dim", `  … ${start} earlier tasks`));
 		for (const task of shown) {
-			const marker = task.status === "passed" ? "✓" : task.status === "running" ? "◉" : task.status === "failed" ? "✗" : "○";
-			const color = task.status === "passed" ? "success" : task.status === "running" ? "accent" : task.status === "failed" ? "error" : "dim";
+			const marker = task.status === "passed" ? "✓" : task.status === "verified" ? "◆" : task.status === "running" ? "◉" : task.status === "failed" ? "✗" : "○";
+			const color = task.status === "passed" ? "success" : task.status === "verified" ? "warning" : task.status === "running" ? "accent" : task.status === "failed" ? "error" : "dim";
 			lines.push(`${this.theme.fg(color, marker)} ${clip(`${task.id}  ${task.title}`, width - 2)}`);
 		}
 		const hiddenAfter = tasks.length - start - shown.length;

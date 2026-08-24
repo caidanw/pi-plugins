@@ -21,7 +21,7 @@ Record the starting `HEAD` in the graph baseline.
 
 ## Task Lifecycle
 
-Workers continue to receive an explicit instruction not to commit. After controller verification succeeds:
+Workers continue to receive an explicit instruction not to mutate Git. The worker guard blocks direct mutating Git shell commands, and the controller compares Git branch and `HEAD` before and after every worker as the authoritative backstop. A changed Git position fails the run for manual recovery. After controller verification succeeds:
 
 1. Persist the task as `verified` with its passing evidence.
 2. Stage all repository changes except controller-owned files.
@@ -31,7 +31,7 @@ Workers continue to receive an explicit instruction not to commit. After control
 
 Allow empty commits so every verified task has a durable task boundary.
 
-If staging or committing fails, leave the task `verified`, preserve staged and working-tree changes, pause the graph, and report the error. Resuming retries the commit before launching any worker, so commit failures never consume a model attempt.
+If staging or committing fails, leave the task `verified`, preserve staged and working-tree changes, pause the graph, and report the error. Resuming retries the commit before launching any worker, so commit failures never consume a model attempt. Record the pre-task `HEAD`; if a commit completed before graph persistence, resume recognizes its task-specific subject and records it instead of creating a duplicate commit.
 
 ## Recovery
 

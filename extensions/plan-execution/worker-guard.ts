@@ -25,6 +25,13 @@ export default function planWorkerGuard(pi: ExtensionAPI) {
 	const protectedPaths = new Set((JSON.parse(raw) as string[]).map((path) => canonical(path, process.cwd())));
 
 	pi.on("tool_call", (event, ctx) => {
+		if (event.toolName === "bash") {
+			const command = (event.input as { command?: unknown }).command;
+			if (typeof command === "string" && /\bgit\b[^\n;&|]*\b(?:add|am|apply|branch|checkout|cherry-pick|clean|commit|merge|rebase|reset|restore|revert|stash|switch|tag|update-ref)\b/.test(command)) {
+				return { block: true, reason: "The plan controller owns Git mutations and task commits." };
+			}
+			return;
+		}
 		if (event.toolName !== "edit" && event.toolName !== "write") return;
 		const input = event.input as { path?: unknown; file_path?: unknown };
 		const path = typeof input.path === "string" ? input.path : input.file_path;

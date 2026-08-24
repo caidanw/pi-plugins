@@ -5,12 +5,12 @@ import { basename, dirname, extname, join, resolve } from "node:path";
 import { StringDecoder } from "node:string_decoder";
 
 const RUN_STATUSES = new Set(["draft", "approved", "running", "paused", "completed", "failed"]);
-const TASK_STATUSES = new Set(["pending", "running", "passed", "failed"]);
+const TASK_STATUSES = new Set(["pending", "running", "verified", "passed", "failed"]);
 const OUTPUT_LIMIT = 50 * 1024;
 
 export type RunStatus = "draft" | "approved" | "running" | "paused" | "completed" | "failed";
-export type TaskStatus = "pending" | "running" | "passed" | "failed";
-export type EvidenceKind = "worker" | "integrity" | "verification";
+export type TaskStatus = "pending" | "running" | "verified" | "passed" | "failed";
+export type EvidenceKind = "worker" | "integrity" | "verification" | "commit";
 
 export type TaskEvidence = {
 	attempt: number;
@@ -30,6 +30,7 @@ export type PlanTask = {
 	verification: string;
 	status: TaskStatus;
 	attempts: number;
+	commitBase: string;
 	evidence: TaskEvidence[];
 };
 
@@ -37,7 +38,8 @@ export type TaskGraph = {
 	version: 1;
 	sourcePlan: string;
 	status: RunStatus;
-	baseline: { gitStatus: string; gitDiff: string };
+	commitAfterTask: boolean;
+	baseline: { gitStatus: string; gitDiff: string; gitHead: string };
 	tasks: PlanTask[];
 };
 
@@ -85,7 +87,7 @@ function strings(value: unknown, label: string, allowEmpty = false): string[] {
 function parseEvidence(value: unknown, label: string): TaskEvidence {
 	const input = object(value, label);
 	if (!Number.isInteger(input.attempt) || Number(input.attempt) < 1) throw new Error(`${label}.attempt must be a positive integer`);
-	if (input.kind !== "worker" && input.kind !== "integrity" && input.kind !== "verification") throw new Error(`${label}.kind is invalid`);
+	if (input.kind !== "worker" && input.kind !== "integrity" && input.kind !== "verification" && input.kind !== "commit") throw new Error(`${label}.kind is invalid`);
 	if (!Number.isInteger(input.exitCode)) throw new Error(`${label}.exitCode must be an integer`);
 	return {
 		attempt: Number(input.attempt),
@@ -113,6 +115,7 @@ function parseTask(value: unknown, index: number): PlanTask {
 		verification: string(input.verification, `tasks[${index}].verification`),
 		status: status as TaskStatus,
 		attempts: Number(input.attempts),
+		commitBase: typeof input.commitBase === "string" ? input.commitBase : "",
 		evidence: (evidenceInput ?? []).map((item, evidenceIndex) => parseEvidence(item, `tasks[${index}].evidence[${evidenceIndex}]`)),
 	};
 }
@@ -125,6 +128,7 @@ export function validateTaskGraph(graph: TaskGraph): void {
 		ids.add(task.id);
 	}
 	for (const task of graph.tasks) {
+		if (task.status === "verified" && (!graph.commitAfterTask || !task.commitBase)) throw new Error(`${task.id} has invalid verified state`);
 		for (const dependency of task.dependsOn) {
 			if (!ids.has(dependency)) throw new Error(`${task.id} depends on missing task ${dependency}`);
 			if (dependency === task.id) throw new Error(`${task.id} cannot depend on itself`);
@@ -155,9 +159,11 @@ export function parseTaskGraph(value: unknown): TaskGraph {
 		version: 1,
 		sourcePlan: string(input.sourcePlan, "sourcePlan"),
 		status: input.status as RunStatus,
+		commitAfterTask: input.commitAfterTask === true,
 		baseline: {
 			gitStatus: typeof baseline.gitStatus === "string" ? baseline.gitStatus : "",
 			gitDiff: typeof baseline.gitDiff === "string" ? baseline.gitDiff : "",
+			gitHead: typeof baseline.gitHead === "string" ? baseline.gitHead : "",
 		},
 		tasks: input.tasks.map(parseTask),
 	};
@@ -170,8 +176,8 @@ export function initializeGraph(graph: TaskGraph, sourcePlan: string): TaskGraph
 		...graph,
 		sourcePlan,
 		status: "approved",
-		baseline: { gitStatus: "", gitDiff: "" },
-		tasks: graph.tasks.map((task) => ({ ...task, status: "pending", attempts: 0, evidence: [] })),
+		baseline: { gitStatus: "", gitDiff: "", gitHead: "" },
+		tasks: graph.tasks.map((task) => ({ ...task, status: "pending", attempts: 0, commitBase: "", evidence: [] })),
 	};
 	validateTaskGraph(initialized);
 	return initialized;
@@ -184,11 +190,13 @@ export function parsePlannerTaskGraph(value: unknown, sourcePlan: string): TaskG
 		version: 1,
 		sourcePlan,
 		status: "draft",
-		baseline: { gitStatus: "", gitDiff: "" },
+		commitAfterTask: true,
+		baseline: { gitStatus: "", gitDiff: "", gitHead: "" },
 		tasks: input.tasks.map((task, index) => ({
 			...object(task, `planner submission.tasks[${index}]`),
 			status: "pending",
 			attempts: 0,
+			commitBase: "",
 			evidence: [],
 		})),
 	});

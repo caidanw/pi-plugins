@@ -27,7 +27,8 @@ function graph(tasks = [task("T001")]) {
 		version: 1,
 		sourcePlan: "plan.md",
 		status: "approved",
-		baseline: { gitStatus: "", gitDiff: "" },
+		commitAfterTask: false,
+		baseline: { gitStatus: "", gitDiff: "", gitHead: "" },
 		tasks,
 	};
 }
@@ -43,6 +44,7 @@ function task(id, dependsOn = []) {
 		verification: "true",
 		status: "pending",
 		attempts: 0,
+		commitBase: "",
 		evidence: [],
 	};
 }
@@ -96,6 +98,12 @@ function extensionHarness(directory, selection, options = {}) {
 	};
 }
 
+async function initializeGit(directory) {
+	assert.equal((await runVerification("git init -q", directory, undefined, 10_000)).code, 0);
+	assert.equal((await runVerification("git config user.email test@example.com && git config user.name Test", directory, undefined, 10_000)).code, 0);
+	assert.equal((await runVerification("git add -A && git commit --allow-empty -qm initial", directory, undefined, 10_000)).code, 0);
+}
+
 function useFakePi(t, path) {
 	const previous = process.env.PI_PLAN_PI_BINARY;
 	process.env.PI_PLAN_PI_BINARY = path;
@@ -121,7 +129,9 @@ test("planner submits one terminating structured task graph", async () => {
 	const result = await tool.execute("call", { tasks });
 	assert.equal(result.terminate, true);
 	assert.deepEqual(result.details, { tasks });
-	assert.equal(parsePlannerTaskGraph(result.details, "plan.md").status, "draft");
+	const graph = parsePlannerTaskGraph(result.details, "plan.md");
+	assert.equal(graph.status, "draft");
+	assert.equal(graph.commitAfterTask, true);
 });
 
 test("planner feedback can target one task or the whole graph", () => {
@@ -368,6 +378,10 @@ else if (prompt.includes("fresh read-only final auditor")) { writeFileSync(join(
 else process.exit(2);
 `);
 	await chmod(fakePi, 0o755);
+	const legacyDraft = graph();
+	legacyDraft.sourcePlan = "docs/plan.md";
+	legacyDraft.status = "draft";
+	await saveTaskGraph(tasksPath, legacyDraft);
 	useFakePi(t, fakePi);
 
 	let dirtyMessage = "";
@@ -404,6 +418,60 @@ else process.exit(2);
 	assert.match(auditPrompt, /controller[\s\S]*docs\/plan\.md[\s\S]*docs\/plan\.tasks\.json[\s\S]*docs\/plan\.audit\.md/i);
 });
 
+test("commit-enabled plans stay draft when implementation changes already exist", async (t) => {
+	const directory = await temporaryDirectory(t);
+	const fakePi = join(directory, "fake-pi.mjs");
+	await writeFile(join(directory, "plan.md"), "# Plan\n");
+	await writeFile(fakePi, `#!/usr/bin/env node
+const prompt = process.argv.at(-1) ?? "";
+if (!prompt.includes("read-only implementation planner")) process.exit(2);
+console.log(JSON.stringify({ type: "tool_execution_end", toolCallId: "submit", toolName: "submit_task_graph", result: { content: [], details: { tasks: [{ id: "T001", title: "Test", instructions: "Test", acceptance: ["It works"], dependsOn: [], expectedFiles: [], verification: "true" }] } }, isError: false }));
+`);
+	await chmod(fakePi, 0o755);
+	await initializeGit(directory);
+	await writeFile(join(directory, "unrelated.txt"), "user work\n");
+	useFakePi(t, fakePi);
+	const { commands, ctx, notifications } = extensionHarness(directory, "Approve and run", { mode: "rpc" });
+
+	await commands.get("execute-plan").handler("plan.md", ctx);
+	const draft = await loadTaskGraph(join(directory, "plan.tasks.json"));
+	assert.equal(draft.status, "draft");
+	assert.equal(draft.commitAfterTask, true);
+	assert.ok(notifications.some(({ message }) => /clean implementation tree[\s\S]*unrelated\.txt/.test(message)));
+});
+
+test("controller stops when a worker changes Git HEAD outside its tool guard", async (t) => {
+	const directory = await temporaryDirectory(t);
+	const fakePi = join(directory, "fake-pi.mjs");
+	await writeFile(join(directory, "plan.md"), "# Plan\n");
+	await writeFile(fakePi, `#!/usr/bin/env node
+import { execFileSync } from "node:child_process";
+import { writeFileSync } from "node:fs";
+import { join } from "node:path";
+const prompt = process.argv.at(-1) ?? "";
+const emit = (text) => console.log(JSON.stringify({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text }], stopReason: "end" } }));
+if (prompt.includes("read-only implementation planner")) console.log(JSON.stringify({ type: "tool_execution_end", toolCallId: "submit", toolName: "submit_task_graph", result: { content: [], details: { tasks: [{ id: "T001", title: "Test", instructions: "Test", acceptance: ["It works"], dependsOn: [], expectedFiles: ["malicious.txt"], verification: "true" }] } }, isError: false }));
+else if (prompt.includes("implementation worker")) {
+  writeFileSync(join(process.cwd(), "malicious.txt"), "bad\\n");
+  execFileSync("git", ["add", "malicious.txt"]);
+  execFileSync("git", ["commit", "-qm", "worker commit"]);
+  emit("done");
+} else process.exit(2);
+`);
+	await chmod(fakePi, 0o755);
+	await initializeGit(directory);
+	useFakePi(t, fakePi);
+	const { commands, ctx } = extensionHarness(directory, "Approve and run", { mode: "rpc" });
+
+	await commands.get("execute-plan").handler("plan.md", ctx);
+	const failed = await waitFor(async () => {
+		const candidate = await loadTaskGraph(join(directory, "plan.tasks.json")).catch(() => undefined);
+		return candidate?.status === "failed" ? candidate : undefined;
+	});
+	assert.equal(failed.tasks[0].status, "failed");
+	assert.match(failed.tasks[0].evidence.at(-1).output, /Worker changed Git position/);
+});
+
 test("streams split Pi JSON events without letting observers change results", async (t) => {
 	const directory = await temporaryDirectory(t);
 	const fakePi = join(directory, "fake-pi.mjs");
@@ -435,6 +503,7 @@ else if (prompt.includes("fresh read-only final auditor")) emit("No findings.");
 else process.exit(2);
 `);
 	await chmod(fakePi, 0o755);
+	await initializeGit(directory);
 	useFakePi(t, fakePi);
 	const ui = {
 		custom: (factory) => {
@@ -454,6 +523,7 @@ else process.exit(2);
 	await waitFor(() => loadTaskGraph(join(directory, "plan.tasks.json")).then(({ status }) => status === "completed").catch(() => false));
 	assert.ok(notifications.some(({ message }) => message.includes("planning continues")));
 	assert.ok(notifications.some(({ message }) => message.includes("Progress dashboard closed")));
+	assert.match((await runVerification("git log --format=%s -1", directory, undefined, 10_000)).stdout, /plan\(T001\): T001/);
 });
 
 test("plan commands leave durable visible feedback", async (t) => {
@@ -535,6 +605,8 @@ test("worker guard blocks path aliases without blocking unrelated new files", as
 
 	assert.equal(handler({ toolName: "write", input: { path: join(directory, "nested", "..", "plan.md") } }, { cwd: directory }).block, true);
 	assert.equal(handler({ toolName: "write", input: { path: "new/deep/file.ts" } }, { cwd: directory }), undefined);
+	assert.equal(handler({ toolName: "bash", input: { command: "git -C . commit -am done" } }, { cwd: directory }).block, true);
+	assert.equal(handler({ toolName: "bash", input: { command: "git diff --stat" } }, { cwd: directory }), undefined);
 });
 
 test("normalizes stale running state and preserves it across persistence", async (t) => {
@@ -693,9 +765,7 @@ test("launches one fresh repair worker, writes a successful audit, and preserves
 	const planPath = join(directory, "plan.md");
 	const fakePi = join(directory, "fake-pi.mjs");
 	await writeFile(planPath, "# Repair plan\n\nCreate fixed.txt.\n");
-	assert.equal((await runVerification("git init -q", directory, undefined, 10_000)).code, 0);
-	await writeFile(join(directory, "baseline.txt"), "staged baseline\n");
-	assert.equal((await runVerification("git add baseline.txt", directory, undefined, 10_000)).code, 0);
+	await writeFile(join(directory, "baseline.txt"), "baseline\n");
 	await writeFile(fakePi, `#!/usr/bin/env node
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -718,6 +788,7 @@ if (prompt.includes("read-only implementation planner")) {
 }
 `);
 	await chmod(fakePi, 0o755);
+	await initializeGit(directory);
 	useFakePi(t, fakePi);
 	const { commands, ctx } = extensionHarness(directory, "Approve and run");
 
@@ -726,16 +797,107 @@ if (prompt.includes("read-only implementation planner")) {
 	const completed = await loadTaskGraph(join(directory, "plan.tasks.json"));
 	assert.equal(completed.status, "completed");
 	assert.equal(completed.tasks[0].attempts, 2);
-	assert.deepEqual(completed.tasks[0].evidence.map(({ exitCode }) => exitCode), [1, 0]);
+	assert.deepEqual(completed.tasks[0].evidence.map(({ exitCode }) => exitCode), [1, 0, 0]);
 	assert.equal(await readFile(join(directory, "worker-count.txt"), "utf8"), "2");
 	assert.match(await readFile(join(directory, "plan.audit.md"), "utf8"), /No findings/);
-	assert.match(await readFile(join(directory, "audit-prompt.txt"), "utf8"), /## Staged[\s\S]*staged baseline/);
+	assert.match(await readFile(join(directory, "audit-prompt.txt"), "utf8"), /implementation-commit-log[\s\S]*plan\(T001\)/);
+	assert.match(await readFile(join(directory, "audit-prompt.txt"), "utf8"), /implementation-committed-diff[\s\S]*fixed\.txt/);
 	assert.match(await readFile(join(directory, "audit-prompt.txt"), "utf8"), /controller-owned-files|owned by the controller/i);
 
 	const reloaded = extensionHarness(directory, "Approve and run");
 	await reloaded.commands.get("execute-plan").handler("plan.md", reloaded.ctx);
 	assert.match(reloaded.notifications.at(-1).message, /already completed/);
 	assert.equal(await readFile(join(directory, "worker-count.txt"), "utf8"), "2");
+});
+
+test("a failed task commit pauses and resume retries it without another worker attempt", async (t) => {
+	const directory = await temporaryDirectory(t);
+	const planPath = join(directory, "plan.md");
+	const tasksPath = join(directory, "plan.tasks.json");
+	const fakePi = join(directory, "fake-pi.mjs");
+	const workerCount = join(directory, "worker-count.txt");
+	await writeFile(planPath, "# Commit recovery\n");
+	await writeFile(fakePi, `#!/usr/bin/env node
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+const prompt = process.argv.at(-1) ?? "";
+const emit = (text) => console.log(JSON.stringify({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text }], stopReason: "end" } }));
+if (prompt.includes("read-only implementation planner")) console.log(JSON.stringify({ type: "tool_execution_end", toolCallId: "submit", toolName: "submit_task_graph", result: { content: [], details: { tasks: [{ id: "T001", title: "Recover commit", instructions: "Create result", acceptance: ["Result exists"], dependsOn: [], expectedFiles: ["result.txt"], verification: "test -f result.txt" }] } }, isError: false }));
+else if (prompt.includes("implementation worker")) {
+  const countPath = join(process.cwd(), "worker-count.txt");
+  const count = existsSync(countPath) ? Number(readFileSync(countPath, "utf8")) + 1 : 1;
+  writeFileSync(countPath, String(count));
+  writeFileSync(join(process.cwd(), "result.txt"), "done\\n");
+  emit("done");
+} else if (prompt.includes("fresh read-only final auditor")) emit("No findings.");
+else process.exit(2);
+`);
+	await chmod(fakePi, 0o755);
+	await initializeGit(directory);
+	const hook = join(directory, ".git", "hooks", "pre-commit");
+	await writeFile(hook, "#!/bin/sh\necho blocked >&2\nexit 1\n");
+	await chmod(hook, 0o755);
+	useFakePi(t, fakePi);
+
+	const first = extensionHarness(directory, "Approve and run", { mode: "rpc" });
+	await first.commands.get("execute-plan").handler("plan.md", first.ctx);
+	const paused = await waitFor(async () => {
+		const value = await loadTaskGraph(tasksPath).catch(() => undefined);
+		return value?.status === "paused" ? value : undefined;
+	});
+	assert.equal(paused.tasks[0].status, "verified");
+	assert.equal(paused.tasks[0].attempts, 1);
+	assert.equal(await readFile(workerCount, "utf8"), "1");
+	assert.match(paused.tasks[0].evidence.at(-1).output, /blocked/);
+
+	await rm(hook);
+	const resumed = extensionHarness(directory, "Resume", { mode: "rpc" });
+	await resumed.commands.get("execute-plan").handler("plan.md", resumed.ctx);
+	const completed = await waitFor(async () => {
+		const value = await loadTaskGraph(tasksPath).catch(() => undefined);
+		return value?.status === "completed" ? value : undefined;
+	});
+	assert.equal(completed.tasks[0].attempts, 1);
+	assert.equal(await readFile(workerCount, "utf8"), "1");
+	assert.deepEqual(completed.tasks[0].evidence.map(({ kind }) => kind), ["verification", "commit", "commit"]);
+});
+
+test("resume recognizes a task commit completed before graph persistence", async (t) => {
+	const directory = await temporaryDirectory(t);
+	const tasksPath = join(directory, "plan.tasks.json");
+	const fakePi = join(directory, "fake-pi.mjs");
+	await writeFile(join(directory, "plan.md"), "# Crash recovery\n");
+	await writeFile(fakePi, `#!/usr/bin/env node
+const prompt = process.argv.at(-1) ?? "";
+if (!prompt.includes("fresh read-only final auditor")) process.exit(2);
+console.log(JSON.stringify({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "No findings." }], stopReason: "end" } }));
+`);
+	await chmod(fakePi, 0o755);
+	await initializeGit(directory);
+	const base = (await runVerification("git rev-parse HEAD", directory, undefined, 10_000)).stdout.trim();
+	await writeFile(join(directory, "result.txt"), "done\n");
+	assert.equal((await runVerification("git add result.txt && git commit -qm 'plan(T001): Recover persistence'", directory, undefined, 10_000)).code, 0);
+	const value = graph();
+	value.status = "paused";
+	value.commitAfterTask = true;
+	value.baseline.gitHead = base;
+	value.tasks[0].title = "Recover persistence";
+	value.tasks[0].status = "verified";
+	value.tasks[0].attempts = 1;
+	value.tasks[0].commitBase = base;
+	value.tasks[0].evidence.push({ attempt: 1, kind: "verification", command: "true", exitCode: 0, output: "" });
+	await saveTaskGraph(tasksPath, value);
+	useFakePi(t, fakePi);
+
+	const { commands, ctx } = extensionHarness(directory, "Resume", { mode: "rpc" });
+	await commands.get("execute-plan").handler("plan.md", ctx);
+	const completed = await waitFor(async () => {
+		const candidate = await loadTaskGraph(tasksPath).catch(() => undefined);
+		return candidate?.status === "completed" ? candidate : undefined;
+	});
+	assert.equal(completed.tasks[0].status, "passed");
+	assert.equal(completed.tasks[0].evidence.at(-1).kind, "commit");
+	assert.equal(Number((await runVerification("git rev-list --count HEAD", directory, undefined, 10_000)).stdout), 2);
 });
 
 test("unauthenticated resume leaves executable state untouched", async (t) => {
@@ -779,6 +941,7 @@ if (prompt.includes("read-only implementation planner")) {
 }
 `);
 	await chmod(fakePi, 0o755);
+	await initializeGit(directory);
 
 	useFakePi(t, fakePi);
 	const { commands, notifications, ctx } = extensionHarness(directory, "Approve and run", { mode: "rpc" });
@@ -795,6 +958,11 @@ if (prompt.includes("read-only implementation planner")) {
 
 	assert.deepEqual(completed.tasks.map(({ status }) => status), ["passed", "passed"]);
 	assert.deepEqual(completed.tasks.map(({ evidence }) => evidence.at(-1).exitCode), [0, 0]);
+	assert.deepEqual(completed.tasks.map(({ evidence }) => evidence.at(-1).kind), ["commit", "commit"]);
+	const commitLog = await runVerification("git log --format=%s -2", directory, undefined, 10_000);
+	assert.match(commitLog.stdout, /plan\(T002\): T002[\s\S]*plan\(T001\): T001/);
+	const committedFiles = await runVerification("git diff --name-only HEAD~2..HEAD", directory, undefined, 10_000);
+	assert.deepEqual(committedFiles.stdout.trim().split("\n").sort(), ["first.txt", "second.txt"]);
 	assert.deepEqual(await Promise.all(["first.txt", "second.txt"].map((name) => readFile(join(directory, name), "utf8"))), ["done\n", "done\n"]);
 	await waitFor(() => notifications.some(({ message }) => message.includes("audit failed")));
 });

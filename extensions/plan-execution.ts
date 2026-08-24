@@ -41,7 +41,7 @@ type ActiveRun = {
 	paths: ReturnType<typeof planPaths>;
 	graph: TaskGraph;
 	ctx: ExtensionCommandContext;
-	phase: "worker" | "verification" | "audit";
+	phase: "worker" | "verification" | "commit" | "audit";
 	currentTaskId?: string;
 	abort?: AbortController;
 	stopRequested: boolean;
@@ -76,7 +76,7 @@ export async function discoverResumablePlans(cwd: string): Promise<ResumablePlan
 				modifiedAt,
 			};
 			const passed = graph.tasks.filter((task) => task.status === "passed").length;
-			const current = graph.tasks.find((task) => task.status === "running") ?? nextReadyTask(graph);
+			const current = graph.tasks.find((task) => task.status === "running" || task.status === "verified") ?? nextReadyTask(graph);
 			return {
 				label: `${graph.status.padEnd(8)}  ${passed}/${graph.tasks.length}  ${sourceLabel}${current ? ` — ${current.id}` : ""}`,
 				tasksPath,
@@ -138,7 +138,7 @@ function workerPrompt(sourcePlan: string, graph: TaskGraph, task: PlanTask): str
 		return dependency ? `${dependency.id}: ${dependency.title}\n${JSON.stringify(dependency.evidence)}` : id;
 	}).join("\n\n");
 	const previousFailure = task.evidence.at(-1);
-	return `You are the implementation worker for exactly one approved task. Work in the current repository and finish this task. You may inspect the source plan and repository for context. Do not edit the source plan or task graph. Do not implement unrelated future tasks. Do not make Git commits. The controller will run verification after you exit.
+	return `You are the implementation worker for exactly one approved task. Work in the current repository and finish this task. You may inspect the source plan and repository for context. Do not edit the source plan or task graph. Do not implement unrelated future tasks. Do not stage, commit, reset, restore, or check out Git changes. The controller will verify and commit after you exit.
 
 Source plan: ${sourcePlan}
 Task: ${task.id} — ${task.title}
@@ -152,7 +152,15 @@ ${dependencies ? `\nCompleted dependencies:\n${dependencies}` : ""}
 ${previousFailure ? `\nPrevious attempt failed:\n${previousFailure.output}` : ""}`;
 }
 
-function auditPrompt(plan: string, graph: TaskGraph, finalStatus: string, finalDiff: string, controllerFiles: string[]): string {
+function auditPrompt(
+	plan: string,
+	graph: TaskGraph,
+	finalStatus: string,
+	finalDiff: string,
+	controllerFiles: string[],
+	committedLog: string,
+	committedDiff: string,
+): string {
 	return `You are a fresh read-only final auditor. Compare the source plan, approved task graph, verification evidence, and repository state. Do not modify files. Report concise findings under severity headings. If no problems are found, say so.
 
 Check for:
@@ -169,6 +177,8 @@ ${controllerFiles.map((path) => `- ${path}`).join("\n")}
 <task-graph>\n${JSON.stringify(graph, null, 2)}\n</task-graph>
 <baseline-git-status>\n${graph.baseline.gitStatus}\n</baseline-git-status>
 <baseline-git-diff>\n${graph.baseline.gitDiff}\n</baseline-git-diff>
+<implementation-commit-log>\n${committedLog}\n</implementation-commit-log>
+<implementation-committed-diff>\n${committedDiff}\n</implementation-committed-diff>
 <final-git-status>\n${finalStatus}\n</final-git-status>
 <final-git-diff>\n${finalDiff}\n</final-git-diff>`;
 }
@@ -189,11 +199,12 @@ async function fileExists(path: string): Promise<boolean> {
 	}
 }
 
-async function gitState(cwd: string): Promise<{ gitStatus: string; gitDiff: string }> {
-	const [status, working, staged] = await Promise.all([
+async function gitState(cwd: string): Promise<TaskGraph["baseline"]> {
+	const [status, working, staged, head] = await Promise.all([
 		runVerification("git status --short --untracked-files=all", cwd, undefined, 10_000),
 		runVerification("git diff --no-ext-diff", cwd, undefined, 10_000),
 		runVerification("git diff --cached --no-ext-diff", cwd, undefined, 10_000),
+		runVerification("git rev-parse --verify HEAD", cwd, undefined, 10_000),
 	]);
 	const diff = [
 		working.code === 0 && working.stdout ? `## Working tree\n${working.stdout}` : "",
@@ -202,6 +213,7 @@ async function gitState(cwd: string): Promise<{ gitStatus: string; gitDiff: stri
 	return {
 		gitStatus: status.code === 0 ? boundedOutput(status.stdout) : "",
 		gitDiff: boundedOutput(diff),
+		gitHead: head.code === 0 ? head.stdout.trim() : "",
 	};
 }
 
@@ -209,16 +221,62 @@ function shellQuote(value: string): string {
 	return `'${value.replaceAll("'", `'"'"'`)}'`;
 }
 
-async function gitStatusWithout(cwd: string, paths: string[]): Promise<string> {
+async function gitLocalPaths(cwd: string, paths: string[]): Promise<string[]> {
 	const canonicalCwd = await realpath(cwd).catch(() => cwd);
-	const exclusions = paths.flatMap((path) => {
+	return paths.flatMap((path) => {
 		const local = relative(canonicalCwd, path);
 		if (!local || isAbsolute(local) || local === ".." || local.startsWith(`..${sep}`)) return [];
-		return [shellQuote(`:(exclude)${local.split(sep).join("/")}`)];
+		return [local.split(sep).join("/")];
 	});
-	const pathspec = exclusions.length ? ` -- . ${exclusions.join(" ")}` : "";
+}
+
+async function gitPathspecWithout(cwd: string, paths: string[]): Promise<string> {
+	const exclusions = (await gitLocalPaths(cwd, paths)).map((path) => shellQuote(`:(exclude,literal)${path}`));
+	return exclusions.length ? ` -- . ${exclusions.join(" ")}` : "";
+}
+
+async function gitStatusWithout(cwd: string, paths: string[]): Promise<string> {
+	const pathspec = await gitPathspecWithout(cwd, paths);
 	const status = await runVerification(`git status --short --untracked-files=all${pathspec}`, cwd, undefined, 10_000);
 	return status.code === 0 ? boundedOutput(status.stdout) : "";
+}
+
+async function gitCommittedState(cwd: string, baseHead: string): Promise<{ log: string; diff: string }> {
+	if (!baseHead) return { log: "", diff: "" };
+	const [log, diff] = await Promise.all([
+		runVerification(`git log --oneline ${shellQuote(`${baseHead}..HEAD`)}`, cwd, undefined, 10_000),
+		runVerification(`git diff --no-ext-diff ${shellQuote(`${baseHead}..HEAD`)}`, cwd, undefined, 30_000),
+	]);
+	return {
+		log: log.code === 0 ? boundedOutput(log.stdout) : "",
+		diff: diff.code === 0 ? boundedOutput(diff.stdout) : "",
+	};
+}
+
+async function gitPosition(cwd: string): Promise<{ head: string; branch: string }> {
+	const [head, branch] = await Promise.all([
+		runVerification("git rev-parse --verify HEAD", cwd, undefined, 10_000),
+		runVerification("git symbolic-ref --quiet --short HEAD", cwd, undefined, 10_000),
+	]);
+	return {
+		head: head.code === 0 ? head.stdout.trim() : "",
+		branch: branch.code === 0 ? branch.stdout.trim() : "",
+	};
+}
+
+async function gitCommitPreflight(cwd: string): Promise<string | undefined> {
+	const [head, branch, name, email, staged] = await Promise.all([
+		runVerification("git rev-parse --verify HEAD", cwd, undefined, 10_000),
+		runVerification("git symbolic-ref --quiet --short HEAD", cwd, undefined, 10_000),
+		runVerification("git config user.name", cwd, undefined, 10_000),
+		runVerification("git config user.email", cwd, undefined, 10_000),
+		runVerification("git diff --cached --quiet", cwd, undefined, 10_000),
+	]);
+	if (head.code !== 0) return "Per-task commits require a Git repository with an existing commit.";
+	if (branch.code !== 0) return "Per-task commits require a named branch, not detached HEAD.";
+	if (name.code !== 0 || !name.stdout.trim() || email.code !== 0 || !email.stdout.trim()) return "Configure Git user.name and user.email before running this plan.";
+	if (staged.code !== 0) return "Unstage existing changes before running this plan.";
+	return undefined;
 }
 
 function evidence(task: PlanTask, kind: TaskEvidence["kind"], exitCode: number, output: string, command?: string): TaskEvidence {
@@ -399,14 +457,18 @@ export default function planExecutionExtension(pi: ExtensionAPI) {
 		run.ctx.ui.setStatus(STATUS_KEY, "auditing plan");
 		run.dashboard?.setPhase("audit", run.graph);
 		run.dashboard?.addActivity("Comparing the completed work with the source plan");
-		const [plan, final] = await Promise.all([readFile(run.paths.sourcePlan, "utf8"), gitState(run.ctx.cwd)]);
+		const [plan, final, committed] = await Promise.all([
+			readFile(run.paths.sourcePlan, "utf8"),
+			gitState(run.ctx.cwd),
+			gitCommittedState(run.ctx.cwd, run.graph.baseline.gitHead),
+		]);
 		const result = await runPi({
 			cwd: run.ctx.cwd,
 			prompt: auditPrompt(plan, run.graph, final.gitStatus, final.gitDiff, [
 				relative(run.ctx.cwd, run.paths.sourcePlan),
 				relative(run.ctx.cwd, run.paths.tasks),
 				relative(run.ctx.cwd, run.paths.audit),
-			]),
+			], committed.log, committed.diff),
 			model: modelName(run.ctx),
 			thinkingLevel: run.ctx.thinkingLevel,
 			tools: READ_ONLY_TOOLS,
@@ -432,8 +494,78 @@ export default function planExecutionExtension(pi: ExtensionAPI) {
 		report(run.ctx, `Plan paused at ${task.id}`, "info");
 	}
 
+	async function commitVerifiedTask(run: ActiveRun, task: PlanTask): Promise<boolean> {
+		run.phase = "commit";
+		run.abort = new AbortController();
+		run.ctx.ui.setStatus(STATUS_KEY, `${task.id}: committing`);
+		run.dashboard?.setPhase("commit", run.graph, task);
+		run.dashboard?.addActivity(`${task.id}: committing verified changes`);
+		const message = `plan(${task.id}): ${task.title.replace(/\s+/g, " ").trim()}`;
+		const controllerFiles = [run.paths.sourcePlan, run.paths.tasks, run.paths.audit];
+		const [position, subject, dirty, stagedBefore] = await Promise.all([
+			gitPosition(run.ctx.cwd),
+			runVerification("git log -1 --format=%s", run.ctx.cwd, undefined, 10_000),
+			gitStatusWithout(run.ctx.cwd, controllerFiles),
+			runVerification("git diff --cached --quiet", run.ctx.cwd, undefined, 10_000),
+		]);
+		if (task.commitBase && position.head !== task.commitBase && subject.code === 0 && subject.stdout.trim() === message) {
+			run.abort = undefined;
+			if (dirty || stagedBefore.code !== 0) {
+				run.graph.status = "paused";
+				await saveTaskGraph(run.paths.tasks, run.graph);
+				report(run.ctx, `${task.id} was committed, but additional changes remain. Clean the tree before resuming:\n${dirty}`, "warning");
+				return false;
+			}
+			task.evidence.push(evidence(task, "commit", 0, position.head, message));
+			task.status = "passed";
+			await saveTaskGraph(run.paths.tasks, run.graph);
+			run.dashboard?.addActivity(`${task.id}: recovered commit ${position.head.slice(0, 12)}`);
+			return true;
+		}
+
+		const localControllerFiles = await gitLocalPaths(run.ctx.cwd, controllerFiles);
+		const reset = localControllerFiles.length
+			? await runVerification(`git reset -q HEAD -- ${localControllerFiles.map((path) => shellQuote(`:(literal)${path}`)).join(" ")}`, run.ctx.cwd, run.abort.signal, 30_000)
+			: { code: 0, stdout: "", stderr: "", aborted: false, timedOut: false };
+		const pathspec = await gitPathspecWithout(run.ctx.cwd, controllerFiles);
+		const staged = reset.code === 0
+			? await runVerification(`git add -A${pathspec}`, run.ctx.cwd, run.abort.signal, 30_000)
+			: reset;
+		const committed = staged.code === 0
+			? await runVerification(`git commit --allow-empty -m ${shellQuote(message)}`, run.ctx.cwd, run.abort.signal, 120_000)
+			: staged;
+		run.abort = undefined;
+
+		if (run.stopRequested || committed.aborted) {
+			run.graph.status = "paused";
+			await saveTaskGraph(run.paths.tasks, run.graph);
+			report(run.ctx, `Plan paused while committing ${task.id}; verified changes were preserved`, "info");
+			return false;
+		}
+		if (committed.code !== 0) {
+			const output = [committed.stdout, committed.stderr].filter(Boolean).join("\n") || "Git commit failed";
+			task.evidence.push(evidence(task, "commit", committed.code || 1, output, message));
+			run.graph.status = "paused";
+			await saveTaskGraph(run.paths.tasks, run.graph);
+			report(run.ctx, `${task.id} verified, but commit failed: ${boundedOutput(output)}`, "error");
+			return false;
+		}
+
+		const head = await runVerification("git rev-parse --verify HEAD", run.ctx.cwd, undefined, 10_000);
+		task.evidence.push(evidence(task, "commit", 0, head.stdout.trim() || committed.stdout.trim(), message));
+		task.status = "passed";
+		await saveTaskGraph(run.paths.tasks, run.graph);
+		run.dashboard?.addActivity(`${task.id}: committed ${head.stdout.trim().slice(0, 12)}`);
+		return true;
+	}
+
 	async function execute(run: ActiveRun): Promise<void> {
 		while (!run.stopRequested) {
+			const verifiedTask = run.graph.commitAfterTask ? run.graph.tasks.find((task) => task.status === "verified") : undefined;
+			if (verifiedTask) {
+				if (!await commitVerifiedTask(run, verifiedTask)) return;
+				continue;
+			}
 			const task = nextReadyTask(run.graph);
 			if (!task) {
 				if (run.graph.tasks.every((candidate) => candidate.status === "passed")) {
@@ -457,8 +589,20 @@ export default function planExecutionExtension(pi: ExtensionAPI) {
 				return;
 			}
 
+			if (run.graph.commitAfterTask && task.attempts === 0) {
+				const dirty = await gitStatusWithout(run.ctx.cwd, [run.paths.sourcePlan, run.paths.tasks, run.paths.audit]);
+				if (dirty) {
+					run.graph.status = "paused";
+					await saveTaskGraph(run.paths.tasks, run.graph);
+					report(run.ctx, `Plan paused before ${task.id}: commit or stash unexpected changes first:\n${dirty}`, "warning");
+					return;
+				}
+			}
+
 			run.abort = new AbortController();
+			const workerPosition = run.graph.commitAfterTask ? await gitPosition(run.ctx.cwd) : undefined;
 			task.attempts++;
+			task.commitBase = workerPosition?.head ?? "";
 			task.status = "running";
 			run.graph.status = "running";
 			run.phase = "worker";
@@ -490,13 +634,25 @@ export default function planExecutionExtension(pi: ExtensionAPI) {
 				onEvent: (event) => run.dashboard?.handlePiEvent(event),
 			});
 			const changed = await restoreChangedFiles(snapshots);
+			if (workerPosition) {
+				const afterWorker = await gitPosition(run.ctx.cwd);
+				if (afterWorker.head !== workerPosition.head || afterWorker.branch !== workerPosition.branch) {
+					task.status = "failed";
+					task.evidence.push(evidence(task, "integrity", 1, `Worker changed Git position from ${workerPosition.branch}@${workerPosition.head} to ${afterWorker.branch}@${afterWorker.head}`));
+					run.graph.status = "failed";
+					run.abort = undefined;
+					await saveTaskGraph(run.paths.tasks, run.graph);
+					report(run.ctx, `${task.id} changed Git HEAD or branch; manual recovery is required`, "error");
+					return;
+				}
+			}
 
 			if (run.stopRequested || worker.aborted) {
 				await pauseTask(run, task);
 				return;
 			}
 
-			let result: "passed" | "retry" | "failed";
+			let result: "verified" | "passed" | "retry" | "failed";
 			if (changed.length > 0) {
 				result = applyAttemptResult(task, evidence(task, "integrity", 1, `Worker changed protected files:\n${changed.join("\n")}`), false);
 			} else {
@@ -525,11 +681,20 @@ export default function planExecutionExtension(pi: ExtensionAPI) {
 						result = applyAttemptResult(task, evidence(task, "integrity", 1, `Protected files changed after worker exit:\n${delayedChanges.join("\n")}`), false);
 					} else {
 						const output = [verification.stdout, verification.stderr, verification.timedOut ? "Verification timed out after 10 minutes." : ""].filter(Boolean).join("\n");
-						result = applyAttemptResult(task, evidence(task, "verification", verification.code, output, task.verification), verification.code === 0 && !verification.timedOut);
+						const passed = verification.code === 0 && !verification.timedOut;
+						const verificationEvidence = evidence(task, "verification", verification.code, output, task.verification);
+						if (passed && run.graph.commitAfterTask) {
+							task.evidence.push(verificationEvidence);
+							task.status = "verified";
+							result = "verified";
+						} else {
+							result = applyAttemptResult(task, verificationEvidence, passed);
+						}
 					}
 				}
 			}
 			run.abort = undefined;
+			if (result === "verified") run.dashboard?.addActivity(`${task.id}: verification passed; preparing commit`);
 			if (result === "passed") run.dashboard?.addActivity(`${task.id}: verification passed`);
 			if (result === "retry") run.dashboard?.addActivity(`${task.id}: attempt failed; preparing repair attempt`);
 			if (result === "failed") {
@@ -656,7 +821,17 @@ export default function planExecutionExtension(pi: ExtensionAPI) {
 				if (!graph) return;
 				graph.baseline = await gitState(ctx.cwd);
 				const dirtyStatus = await gitStatusWithout(ctx.cwd, [paths.sourcePlan, paths.tasks, paths.audit]);
-				if (dirtyStatus && !await ctx.ui.confirm("Dirty worktree", `Existing changes will be recorded for the auditor:\n\n${dirtyStatus}\n\nContinue?`)) return;
+				if (graph.commitAfterTask) {
+					const preflightFailure = await gitCommitPreflight(ctx.cwd);
+					if (preflightFailure) {
+						report(ctx, preflightFailure, "error");
+						return;
+					}
+					if (dirtyStatus) {
+						report(ctx, `Per-task commits require a clean implementation tree. Commit or stash these changes first:\n${dirtyStatus}`, "error");
+						return;
+					}
+				} else if (dirtyStatus && !await ctx.ui.confirm("Dirty worktree", `Existing changes will be recorded for the auditor:\n\n${dirtyStatus}\n\nContinue?`)) return;
 				await saveTaskGraph(paths.tasks, graph);
 				report(ctx, "Plan approved. Keep this checkout read-only while workers run.", "warning");
 				planningAbort = undefined;

@@ -53,6 +53,8 @@ fresh implementation process for one ready task
     ↓
 controller-owned verification
     ↓
+controller-owned task commit
+    ↓
 next task
     ↓
 fresh read-only final auditor
@@ -95,7 +97,7 @@ The review shows each task's:
 
 Selecting **Add feedback** opens a text editor. Feedback may reference task IDs, add missing work, change dependencies, or request task splits and merges. The plugin launches a fresh planner with the original plan, current DAG, and feedback, then repeats the review.
 
-Approval persists the DAG and starts execution automatically. Approval is the trust boundary for model-generated verification commands, which run through the user's shell with the user's permissions. Every regenerated DAG requires fresh approval.
+Approval persists the DAG and starts execution automatically. Approval is the trust boundary for model-generated verification commands, which run through the user's shell with the user's permissions. New graphs require a clean implementation tree and create one controller-owned Git commit after each verified task; controller files are excluded. Every regenerated DAG requires fresh approval.
 
 ## Focused Workflow UI
 
@@ -127,9 +129,11 @@ Close the dashboard after cancellation, failure, or completion and add a durable
   "version": 1,
   "sourcePlan": "docs/plans/feature.md",
   "status": "approved",
+  "commitAfterTask": true,
   "baseline": {
     "gitStatus": "",
-    "gitDiff": ""
+    "gitDiff": "",
+    "gitHead": "abc123"
   },
   "tasks": [
     {
@@ -158,6 +162,7 @@ Required validation:
 - The graph has no cycles.
 - Every task has acceptance criteria and a verification command.
 - Every status is recognized.
+- Commit-enabled graphs have baseline Git state before execution.
 - At least one task exists.
 
 Allow these run statuses: `draft`, `approved`, `running`, `paused`, `completed`, and `failed`.
@@ -171,9 +176,11 @@ draft → approved → running → completed
 Use these task states:
 
 ```text
-pending → running → passed
+pending → running → verified → passed
                   ↘ failed
 ```
+
+For commit-enabled graphs, `verified` persists successful verification before the controller stages and commits task changes. Commit failure pauses the graph at `verified` without consuming another worker attempt. Existing graphs without commit enablement retain the legacy direct `running → passed` transition.
 
 Store the complete dirty-worktree baseline at the graph's top level, expanding untracked directories into individual files. The approval warning may hide the exact source plan, task graph, and audit paths, but they remain in baseline evidence and are identified to the auditor as controller-owned files. Store each verification command, exit code, and bounded output as task completion evidence.
 
@@ -191,8 +198,10 @@ For each task:
 6. Wait for the worker to exit, terminate ordinary remaining process-group descendants, and avoid writing `tasks.json` while the child is alive.
 7. Verify protected-file integrity before and after verification.
 8. Run the verification command through the controller with a 10-minute timeout.
-9. Mark the task passed only when verification exits with code 0.
-10. Continue with the next ready task.
+9. Persist successful verification as `verified`.
+10. Stage all non-controller changes and create `plan(<task-id>): <title>`.
+11. Mark the task passed only after the commit succeeds.
+12. Continue with the next ready task.
 
 The task packet contains:
 
@@ -204,7 +213,7 @@ Expected files
 Verification command
 ```
 
-Workers may read the source plan and repository for context. They must not implement unrelated future tasks. The instruction not to make Git commits is advisory in v1.
+Workers may read the source plan and repository for context. They must not implement unrelated future tasks or stage, commit, reset, restore, or check out Git changes. The controller owns verification and commits.
 
 A worker crash, protected-file violation, verification timeout, or nonzero verification exit consumes the attempt. Launch one fresh repair worker with the original task and failure output only when `attempts < 2`. Persist attempts across pauses and resumes; a pending task already at two attempts fails without launching a third worker. After two unsuccessful attempts, mark the task failed and stop the run.
 
@@ -227,7 +236,7 @@ For each worker:
 5. After the worker exits and after verification, detect content, mode, identity, deletion, rename, symlink, or hard-link changes.
 6. Unlink any changed path, recreate it from the controller snapshot, and reject the attempt if integrity changed through `bash`, a path alias, or another route.
 
-The post-exit integrity check and restoration are authoritative; the tool hook provides early feedback. Process-group cleanup stops ordinary background descendants. A process that deliberately creates a new OS session can escape this v1 control; preventing that requires an OS sandbox. A rejected attempt consumes one of the task's two attempts. Workers retain read access. Only the controller changes task status or evidence.
+The post-exit integrity check and restoration are authoritative; the tool hook provides early feedback. The worker hook also blocks direct mutating Git commands, while pre/post-worker branch and `HEAD` comparison catches indirect Git mutations and stops for manual recovery. Process-group cleanup stops ordinary background descendants. A process that deliberately creates a new OS session can escape this v1 control; preventing that requires an OS sandbox. A rejected attempt consumes one of the task's two attempts. Workers retain read access. Only the controller changes task status or evidence.
 
 ## Final Audit
 
@@ -236,6 +245,7 @@ After every task passes, launch a fresh read-only Pi process. Give it:
 - The original Markdown plan.
 - The completed task graph and evidence.
 - Baseline and final Git status/diff information.
+- The task commit log and committed diff from baseline `HEAD` through final `HEAD`.
 - Read-only repository tools.
 
 Ask it to report:
@@ -258,7 +268,7 @@ Write the result to `<name>.audit.md` and notify the user. V1 does not block com
 - **Regenerate** confirms that all task state and evidence will be discarded, then starts a fresh planning and approval flow.
 - Reject a second run while another controller is active.
 
-Warn before starting from a dirty worktree. If the user proceeds, record bounded baseline Git status plus staged and unstaged diffs in the top-level `baseline` field so the final auditor can distinguish pre-existing changes where possible.
+Commit-enabled graphs require a named branch, configured Git identity, an existing `HEAD`, no staged changes, and a clean implementation tree outside controller-owned paths. Preserve a failing draft and tell the user to commit or stash unrelated changes. Existing legacy graphs may retain the prior dirty-worktree confirmation. Record baseline `HEAD`, status, and staged/unstaged diffs for the final auditor.
 
 ## Error Handling
 
