@@ -137,7 +137,7 @@ function workerPrompt(sourcePlan: string, graph: TaskGraph, task: PlanTask): str
 		const dependency = graph.tasks.find((candidate) => candidate.id === id);
 		return dependency ? `${dependency.id}: ${dependency.title}\n${JSON.stringify(dependency.evidence)}` : id;
 	}).join("\n\n");
-	const previousFailure = task.evidence.at(-1);
+	const previousFailure = task.evidence.slice().reverse().find((item) => item.kind !== "infrastructure");
 	return `You are the implementation worker for exactly one approved task. Work in the current repository and finish this task. You may inspect the source plan and repository for context. Do not edit the source plan or task graph. Do not implement unrelated future tasks. Do not stage, commit, reset, restore, or check out Git changes. The controller will verify and commit after you exit.
 
 Source plan: ${sourcePlan}
@@ -589,7 +589,7 @@ export default function planExecutionExtension(pi: ExtensionAPI) {
 				return;
 			}
 
-			if (run.graph.commitAfterTask && task.attempts === 0) {
+			if (run.graph.commitAfterTask && task.attempts === 0 && task.evidence.at(-1)?.kind !== "infrastructure") {
 				const dirty = await gitStatusWithout(run.ctx.cwd, [run.paths.sourcePlan, run.paths.tasks, run.paths.audit]);
 				if (dirty) {
 					run.graph.status = "paused";
@@ -658,7 +658,14 @@ export default function planExecutionExtension(pi: ExtensionAPI) {
 			} else {
 				const workerFailure = piFailure(worker);
 				if (workerFailure) {
-					result = applyAttemptResult(task, evidence(task, "worker", worker.code || 1, workerFailure), false);
+					task.evidence.push(evidence(task, "infrastructure", worker.code || 1, workerFailure));
+					task.attempts--;
+					task.status = "pending";
+					run.graph.status = "paused";
+					run.abort = undefined;
+					await saveTaskGraph(run.paths.tasks, run.graph);
+					report(run.ctx, `${task.id} paused after a worker process or provider failure; resume when the service is available`, "warning");
+					return;
 				} else {
 					run.phase = "verification";
 					run.ctx.ui.setStatus(STATUS_KEY, `${task.id}: verifying`);

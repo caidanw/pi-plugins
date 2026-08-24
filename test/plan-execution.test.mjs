@@ -810,6 +810,51 @@ if (prompt.includes("read-only implementation planner")) {
 	assert.equal(await readFile(join(directory, "worker-count.txt"), "utf8"), "2");
 });
 
+test("worker process failures pause and resume without consuming implementation attempts", async (t) => {
+	const directory = await temporaryDirectory(t);
+	const tasksPath = join(directory, "plan.tasks.json");
+	const fakePi = join(directory, "fake-pi.mjs");
+	await writeFile(join(directory, "plan.md"), "# Infrastructure recovery\n");
+	await writeFile(fakePi, `#!/usr/bin/env node
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+const prompt = process.argv.at(-1) ?? "";
+const emit = (text) => console.log(JSON.stringify({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text }], stopReason: "end" } }));
+if (prompt.includes("read-only implementation planner")) console.log(JSON.stringify({ type: "tool_execution_end", toolCallId: "submit", toolName: "submit_task_graph", result: { content: [], details: { tasks: [{ id: "T001", title: "Recover network", instructions: "Create result", acceptance: ["Result exists"], dependsOn: [], expectedFiles: ["result.txt"], verification: "test -f result.txt" }] } }, isError: false }));
+else if (prompt.includes("implementation worker")) {
+  const countPath = join(process.cwd(), "worker-count.txt");
+  const count = existsSync(countPath) ? Number(readFileSync(countPath, "utf8")) + 1 : 1;
+  writeFileSync(countPath, String(count));
+  if (count === 1) { process.stderr.write("network disconnected"); process.exit(1); }
+  writeFileSync(join(process.cwd(), "result.txt"), "done\\n");
+  emit("done");
+} else if (prompt.includes("fresh read-only final auditor")) emit("No findings.");
+else process.exit(2);
+`);
+	await chmod(fakePi, 0o755);
+	await initializeGit(directory);
+	useFakePi(t, fakePi);
+
+	const first = extensionHarness(directory, "Approve and run", { mode: "rpc" });
+	await first.commands.get("execute-plan").handler("plan.md", first.ctx);
+	const paused = await waitFor(async () => {
+		const value = await loadTaskGraph(tasksPath).catch(() => undefined);
+		return value?.status === "paused" ? value : undefined;
+	});
+	assert.equal(paused.tasks[0].attempts, 0);
+	assert.equal(paused.tasks[0].evidence.at(-1).kind, "infrastructure");
+
+	const resumed = extensionHarness(directory, "Resume", { mode: "rpc" });
+	await resumed.commands.get("execute-plan").handler("plan.md", resumed.ctx);
+	const completed = await waitFor(async () => {
+		const value = await loadTaskGraph(tasksPath).catch(() => undefined);
+		return value?.status === "completed" ? value : undefined;
+	});
+	assert.equal(completed.tasks[0].attempts, 1);
+	assert.equal(await readFile(join(directory, "worker-count.txt"), "utf8"), "2");
+	assert.deepEqual(completed.tasks[0].evidence.map(({ kind }) => kind), ["infrastructure", "verification", "commit"]);
+});
+
 test("a failed task commit pauses and resume retries it without another worker attempt", async (t) => {
 	const directory = await temporaryDirectory(t);
 	const planPath = join(directory, "plan.md");

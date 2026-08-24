@@ -10,7 +10,7 @@ const OUTPUT_LIMIT = 50 * 1024;
 
 export type RunStatus = "draft" | "approved" | "running" | "paused" | "completed" | "failed";
 export type TaskStatus = "pending" | "running" | "verified" | "passed" | "failed";
-export type EvidenceKind = "worker" | "integrity" | "verification" | "commit";
+export type EvidenceKind = "worker" | "infrastructure" | "integrity" | "verification" | "commit";
 
 export type TaskEvidence = {
 	attempt: number;
@@ -87,7 +87,7 @@ function strings(value: unknown, label: string, allowEmpty = false): string[] {
 function parseEvidence(value: unknown, label: string): TaskEvidence {
 	const input = object(value, label);
 	if (!Number.isInteger(input.attempt) || Number(input.attempt) < 1) throw new Error(`${label}.attempt must be a positive integer`);
-	if (input.kind !== "worker" && input.kind !== "integrity" && input.kind !== "verification" && input.kind !== "commit") throw new Error(`${label}.kind is invalid`);
+	if (input.kind !== "worker" && input.kind !== "infrastructure" && input.kind !== "integrity" && input.kind !== "verification" && input.kind !== "commit") throw new Error(`${label}.kind is invalid`);
 	if (!Number.isInteger(input.exitCode)) throw new Error(`${label}.exitCode must be an integer`);
 	return {
 		attempt: Number(input.attempt),

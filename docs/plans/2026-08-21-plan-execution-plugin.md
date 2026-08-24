@@ -215,7 +215,7 @@ Verification command
 
 Workers may read the source plan and repository for context. They must not implement unrelated future tasks or stage, commit, reset, restore, or check out Git changes. The controller owns verification and commits.
 
-A worker crash, protected-file violation, verification timeout, or nonzero verification exit consumes the attempt. Launch one fresh repair worker with the original task and failure output only when `attempts < 2`. Persist attempts across pauses and resumes; a pending task already at two attempts fails without launching a third worker. After two unsuccessful attempts, mark the task failed and stop the run.
+A worker subprocess or provider failure records infrastructure evidence, preserves partial changes, pauses the graph, and does not consume an implementation attempt. Protected-file violations, verification timeouts, and nonzero verification exits consume the attempt. Launch one fresh repair worker with the original task and failure output only when `attempts < 2`. Persist attempts across intentional pauses and resumes; a pending task already at two implementation attempts fails without launching a third worker. After two unsuccessful implementation attempts, mark the task failed and stop the run.
 
 ## Parallelism
 
@@ -276,7 +276,8 @@ Commit-enabled graphs require a named branch, configured Git identity, an existi
 - Missing or unauthenticated model: stop before writing executable state.
 - Planner crash: retain the last valid task graph.
 - User or shutdown cancellation: restore the current task to pending, preserve its attempt count, and pause the run; never mark it passed.
-- Worker crash, protected-file violation, verification timeout, or nonzero verification exit: record bounded failure evidence and apply the two-attempt rule.
+- Worker subprocess or provider failure: record bounded infrastructure evidence, preserve partial changes, refund the reserved attempt, and pause for explicit resume.
+- Protected-file violation, verification timeout, or nonzero verification exit: record bounded failure evidence and apply the two-attempt rule.
 - No dependency-ready task while pending tasks remain: report an invalid or blocked graph and stop.
 - Audit failure: preserve the completed run and report that the audit could not be generated.
 
